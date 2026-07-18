@@ -1,8 +1,8 @@
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
-index df6659d68..267612922 100644
+index 39354c1cf..19b4ce819 100644
 --- a/backend/cmd/server/wire_gen.go
 +++ b/backend/cmd/server/wire_gen.go
-@@ -283,6 +283,9 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
+@@ -285,6 +285,9 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
  	}
  	imageTaskService := service.ProvideImageTaskService(imageTaskStore, imageStorage, configConfig)
  	asyncImageHandler := handler.NewAsyncImageHandler(imageTaskService, openAIGatewayHandler)
@@ -12,7 +12,7 @@ index df6659d68..267612922 100644
  	batchImageRepository := repository.NewBatchImageRepository(db)
  	batchImageQueue := repository.NewBatchImageQueue(redisClient, configConfig)
  	batchImageModelPricingResolver := service.ProvideBatchImageModelPricingResolver(modelPricingResolver)
-@@ -293,7 +296,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
+@@ -295,7 +298,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
  	batchImageHandler := handler.ProvideBatchImageHandler(batchImagePublicService, batchImageDownloadService, batchImageCleanupService, openAIGatewayHandler)
  	idempotencyCoordinator := service.ProvideIdempotencyCoordinator(idempotencyRepository, configConfig)
  	idempotencyCleanupService := service.ProvideIdempotencyCleanupService(idempotencyRepository, configConfig)
@@ -958,10 +958,10 @@ index 13d3076b5..9a2a7e294 100644
  
  // BuildInfo contains build-time information
 diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
-index 57bf64d02..77520a3dd 100644
+index 54d82a69e..45c75ae5e 100644
 --- a/backend/internal/handler/wire.go
 +++ b/backend/internal/handler/wire.go
-@@ -178,29 +178,31 @@ func ProvideHandlers(
+@@ -181,29 +181,31 @@ func ProvideHandlers(
  	paymentWebhookHandler *PaymentWebhookHandler,
  	availableChannelHandler *AvailableChannelHandler,
  	asyncImageHandler *AsyncImageHandler,
@@ -1011,7 +1011,7 @@ index 57bf64d02..77520a3dd 100644
  	}
  }
  
-@@ -223,6 +225,7 @@ var ProviderSet = wire.NewSet(
+@@ -226,6 +228,7 @@ var ProviderSet = wire.NewSet(
  	NewPaymentWebhookHandler,
  	NewAvailableChannelHandler,
  	NewAsyncImageHandler,
@@ -1124,7 +1124,7 @@ index 000000000..d21a376ed
 +	require.ErrorIs(t, err, service.ErrBackgroundResponseNotFound)
 +}
 diff --git a/backend/internal/repository/wire.go b/backend/internal/repository/wire.go
-index 581831912..d93dd4298 100644
+index 0bfd2d005..ceae07ce9 100644
 --- a/backend/internal/repository/wire.go
 +++ b/backend/internal/repository/wire.go
 @@ -121,6 +121,7 @@ var ProviderSet = wire.NewSet(
@@ -1135,23 +1135,11 @@ index 581831912..d93dd4298 100644
  	NewBatchImageQueue,
  	NewBatchImageDownloadLimiter,
  	NewLeaderLockCache,
-diff --git a/backend/internal/securityaudit/prompt_module.go b/backend/internal/securityaudit/prompt_module.go
-index 691cc7dbd..e1199fcfa 100644
---- a/backend/internal/securityaudit/prompt_module.go
-+++ b/backend/internal/securityaudit/prompt_module.go
-@@ -16,6 +16,7 @@ var ProviderSet = wire.NewSet(
- 	wire.Bind(new(ConfigStore), new(*ConfigManager)),
- 	NewPromptService,
- 	wire.Bind(new(PromptEngine), new(*PromptService)),
-+	wire.Bind(new(PromptAdminService), new(*PromptService)),
- 	NewLegacyModerationAdapter,
- 	NewCoordinator,
- 	NewPromptAdminHandler,
 diff --git a/backend/internal/server/middleware/api_key_auth.go b/backend/internal/server/middleware/api_key_auth.go
-index b9013815a..49bdf1be1 100644
+index bcec39760..345b7bdf3 100644
 --- a/backend/internal/server/middleware/api_key_auth.go
 +++ b/backend/internal/server/middleware/api_key_auth.go
-@@ -26,7 +26,7 @@ func NewAPIKeyAuthMiddleware(apiKeyService *service.APIKeyService, subscriptionS
+@@ -28,7 +28,7 @@ func NewAPIKeyAuthMiddleware(apiKeyService *service.APIKeyService, subscriptionS
  //   - 鉴权（Authentication）：验证 Key 有效性、用户状态、IP 限制 —— 始终执行
  //   - 计费执行（Billing Enforcement）：过期/配额/订阅/余额检查 —— skipBilling 时整块跳过
  //
@@ -1160,7 +1148,7 @@ index b9013815a..49bdf1be1 100644
  // usage 允许过期/配额耗尽的 Key 查询自身用量，billing 用于读取当前 Key 的倍率配置，
  // 异步生图查询允许已耗尽额度的 Key 拉取自身任务结果。
  func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscriptionService *service.SubscriptionService, cfg *config.Config) gin.HandlerFunc {
-@@ -132,7 +132,7 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
+@@ -169,7 +169,7 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
  		// Async image task polling only reads data that already belongs to the
  		// authenticated key and must remain available after the completed
  		// generation consumes the key's remaining balance.
@@ -1169,7 +1157,7 @@ index b9013815a..49bdf1be1 100644
  
  		// ── 4. SimpleMode → early return ─────────────────────────────
  
-@@ -257,6 +257,18 @@ func isAsyncImageTaskRead(method, path string) bool {
+@@ -312,6 +312,18 @@ func isAsyncImageTaskRead(method, path string) bool {
  	return strings.HasPrefix(path, "/v1/images/tasks/") || strings.HasPrefix(path, "/images/tasks/")
  }
  
@@ -1206,10 +1194,10 @@ index 653fd8ba3..aa0bfd763 100644
 +	require.False(t, isBackgroundResponseRead(http.MethodGet, "/v1/responses-archive/resp_bg_123"))
 +}
 diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
-index a1e1de260..87b8f5c0c 100644
+index 07b8f1ebd..5fe79d8e1 100644
 --- a/backend/internal/server/routes/gateway.go
 +++ b/backend/internal/server/routes/gateway.go
-@@ -153,6 +153,9 @@ func RegisterGatewayRoutes(
+@@ -167,6 +167,9 @@ func RegisterGatewayRoutes(
  		// OpenAI Responses API: auto-route based on group platform
  		gateway.POST("/responses", func(c *gin.Context) {
  			if isOpenAIResponsesCompatibleGatewayPlatform(c) {
@@ -1219,7 +1207,7 @@ index a1e1de260..87b8f5c0c 100644
  				h.OpenAIGateway.Responses(c)
  				return
  			}
-@@ -165,6 +168,14 @@ func RegisterGatewayRoutes(
+@@ -179,6 +182,14 @@ func RegisterGatewayRoutes(
  			}
  			h.Gateway.Responses(c)
  		})
@@ -1231,10 +1219,10 @@ index a1e1de260..87b8f5c0c 100644
 +			}
 +			h.BackgroundResponse.Get(c)
 +		})
- 		gateway.POST("/alpha/search", h.OpenAIGateway.AlphaSearch)
+ 		gateway.POST("/alpha/search", textBodyLimit, h.OpenAIGateway.AlphaSearch)
  		gateway.GET("/responses", func(c *gin.Context) {
  			h.OpenAIGateway.ResponsesWebSocket(c)
-@@ -229,6 +240,9 @@ func RegisterGatewayRoutes(
+@@ -244,6 +255,9 @@ func RegisterGatewayRoutes(
  	// OpenAI Responses API（不带v1前缀的别名）— auto-route based on group platform
  	responsesHandler := func(c *gin.Context) {
  		if isOpenAIResponsesCompatibleGatewayPlatform(c) {
@@ -1244,7 +1232,7 @@ index a1e1de260..87b8f5c0c 100644
  			h.OpenAIGateway.Responses(c)
  			return
  		}
-@@ -236,6 +250,14 @@ func RegisterGatewayRoutes(
+@@ -251,6 +265,14 @@ func RegisterGatewayRoutes(
  	}
  	r.POST("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
  	r.POST("/responses/*subpath", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
@@ -1256,7 +1244,7 @@ index a1e1de260..87b8f5c0c 100644
 +		}
 +		h.BackgroundResponse.Get(c)
 +	})
- 	r.POST("/alpha/search", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.OpenAIGateway.AlphaSearch)
+ 	r.POST("/alpha/search", textBodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.OpenAIGateway.AlphaSearch)
  	r.GET("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
  		h.OpenAIGateway.ResponsesWebSocket(c)
 diff --git a/backend/internal/service/background_response_task.go b/backend/internal/service/background_response_task.go
@@ -1711,10 +1699,10 @@ index 243e25d1e..490b97092 100644
  	return NewUpdateService(
  		&updateServiceCacheStub{},
 diff --git a/backend/internal/service/wire.go b/backend/internal/service/wire.go
-index 59037d188..ed1aa6bf8 100644
+index f3ee81539..335aad077 100644
 --- a/backend/internal/service/wire.go
 +++ b/backend/internal/service/wire.go
-@@ -662,6 +662,7 @@ var ProviderSet = wire.NewSet(
+@@ -681,6 +681,7 @@ var ProviderSet = wire.NewSet(
  	NewGatewayService,
  	NewOpenAIGatewayService,
  	ProvideImageTaskService,

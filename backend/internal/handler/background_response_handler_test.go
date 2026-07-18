@@ -55,13 +55,16 @@ func TestBackgroundResponseSubmitSurvivesDisconnectAndPollsFinalResult(t *testin
 		body, err := io.ReadAll(c.Request.Body)
 		require.NoError(t, err)
 		require.False(t, jsonPathBool(body, "background"))
-		require.False(t, jsonPathBool(body, "stream"))
+		require.True(t, jsonPathBool(body, "stream"))
 		require.False(t, jsonPathBool(body, "store"))
 		<-release
-		c.JSON(http.StatusOK, gin.H{
-			"id": "resp_upstream", "object": "response", "status": "completed", "model": "gpt-5.6-terra",
-			"output": []gin.H{{"type": "message", "content": []gin.H{{"type": "output_text", "text": "SUBTOPROXY_OK"}}}},
-		})
+		c.Header("Content-Type", "text/event-stream")
+		_, _ = c.Writer.Write([]byte("event: response.output_text.delta\n"))
+		_, _ = c.Writer.Write([]byte(`data: {"type":"response.output_text.delta","delta":"SUBTOPROXY_"}` + "\n\n"))
+		_, _ = c.Writer.Write([]byte("event: response.output_text.delta\n"))
+		_, _ = c.Writer.Write([]byte(`data: {"type":"response.output_text.delta","delta":"OK"}` + "\n\n"))
+		_, _ = c.Writer.Write([]byte("event: response.completed\n"))
+		_, _ = c.Writer.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_upstream","object":"response","status":"completed","model":"gpt-5.6-terra","output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}` + "\n\n"))
 	}
 
 	router := gin.New()
@@ -104,6 +107,47 @@ func TestBackgroundResponseSubmitSurvivesDisconnectAndPollsFinalResult(t *testin
 	require.Contains(t, pollWriter.Body.String(), "SUBTOPROXY_OK")
 	require.Contains(t, pollWriter.Body.String(), accepted.ID)
 	require.NotContains(t, pollWriter.Body.String(), "resp_upstream")
+}
+
+func TestBackgroundResponseStreamingFailedEventBecomesTerminalFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
+	h := &BackgroundResponseHandler{tasks: tasks}
+	h.execute = func(c *gin.Context) {
+		c.Header("Content-Type", "text/event-stream")
+		_, _ = c.Writer.Write([]byte("event: response.failed\n"))
+		_, _ = c.Writer.Write([]byte(`data: {"type":"response.failed","response":{"error":{"type":"server_error","message":"upstream timeout"}}}` + "\n\n"))
+	}
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{ID: 9, UserID: 7})
+		c.Next()
+	})
+	router.POST("/v1/responses", func(c *gin.Context) { require.True(t, h.TrySubmit(c)) })
+	router.GET("/v1/responses/:response_id", h.Get)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5","background":true,"store":true}`))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var accepted struct {
+		ID string `json:"id"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &accepted))
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, accepted.ID)
+		return err == nil && got.Status == service.BackgroundResponseStatusFailed
+	}, time.Second, 10*time.Millisecond)
+
+	pollReq := httptest.NewRequest(http.MethodGet, "/v1/responses/"+accepted.ID, nil)
+	pollWriter := httptest.NewRecorder()
+	router.ServeHTTP(pollWriter, pollReq)
+	require.Equal(t, http.StatusOK, pollWriter.Code)
+	require.Contains(t, pollWriter.Body.String(), `"status":"failed"`)
+	require.Contains(t, pollWriter.Body.String(), "upstream timeout")
 }
 
 func TestBackgroundResponseTrySubmitRestoresNormalRequest(t *testing.T) {

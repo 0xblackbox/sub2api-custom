@@ -22,8 +22,9 @@ import (
 )
 
 // BackgroundResponseHandler detaches background=true requests from the client
-// connection, executes the existing Responses gateway with stream disabled,
-// and stores the final response in Redis for later polling.
+// connection, executes the existing Responses gateway in streaming mode, drains
+// the SSE stream server-side, and stores the final Response object in Redis for
+// later polling.
 type BackgroundResponseHandler struct {
 	tasks   *service.BackgroundResponseTaskService
 	openAI  *OpenAIGatewayHandler
@@ -173,6 +174,16 @@ func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, rec
 	}
 	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
 		if len(body) == 0 || !json.Valid(body) {
+			if finalResponse, ok := backgroundResponseFinalResponseFromSSE(body, taskID); ok {
+				if err := h.tasks.Complete(context.Background(), taskID, statusCode, finalResponse); err != nil {
+					logger.L().Error("background_response.complete_store_failed", zap.String("response_id", taskID), zap.Error(err))
+				}
+				return
+			}
+			if taskErr, ok := backgroundResponseErrorFromSSE(body); ok {
+				h.failTask(taskID, http.StatusBadGateway, taskErr)
+				return
+			}
 			h.failTask(taskID, http.StatusBadGateway, backgroundResponseErrorPayload("api_error", "upstream returned an invalid response"))
 			return
 		}
@@ -196,7 +207,11 @@ func normalizeBackgroundResponseExecutionBody(body []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	body, err = sjson.SetBytes(body, "stream", false)
+	// OAuth / ChatGPT internal upstreams often cut long non-streaming requests
+	// around the proxy/LB timeout boundary. Execute local background jobs via
+	// streaming drain instead, then persist the terminal Response object so the
+	// public polling contract still matches OpenAI's background API.
+	body, err = sjson.SetBytes(body, "stream", true)
 	if err != nil {
 		return nil, err
 	}
@@ -293,6 +308,253 @@ func extractBackgroundResponseError(body []byte) json.RawMessage {
 func backgroundResponseErrorPayload(errorType, message string) json.RawMessage {
 	data, _ := json.Marshal(gin.H{"type": errorType, "message": message})
 	return data
+}
+
+func backgroundResponseFinalResponseFromSSE(body []byte, fallbackID string) (json.RawMessage, bool) {
+	if len(body) == 0 {
+		return nil, false
+	}
+	var finalResponse []byte
+	var outputItems []json.RawMessage
+	seenItems := make(map[string]struct{})
+	var textBuilder strings.Builder
+	finalText := ""
+
+	backgroundResponseForEachSSEDataPayload(body, func(data []byte) {
+		if len(data) == 0 || !gjson.ValidBytes(data) {
+			return
+		}
+		eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
+		switch eventType {
+		case "response.output_text.delta":
+			textBuilder.WriteString(gjson.GetBytes(data, "delta").String())
+		case "response.output_text.done":
+			if text := gjson.GetBytes(data, "text").String(); text != "" {
+				finalText = text
+			}
+		case "response.output_item.done":
+			item := gjson.GetBytes(data, "item")
+			if !item.Exists() || !item.IsObject() || item.Raw == "" {
+				return
+			}
+			key := strings.TrimSpace(item.Get("id").String())
+			if key == "" {
+				key = item.Raw
+			}
+			if _, ok := seenItems[key]; ok {
+				return
+			}
+			seenItems[key] = struct{}{}
+			outputItems = append(outputItems, json.RawMessage(item.Raw))
+		case "response.completed", "response.done":
+			if finalResponse != nil {
+				return
+			}
+			response := gjson.GetBytes(data, "response")
+			if response.Exists() && response.IsObject() && response.Raw != "" {
+				finalResponse = []byte(response.Raw)
+				return
+			}
+			// Some compatible upstreams emit a terminal event without embedding
+			// response. Synthesize the minimal Response object from accumulated
+			// deltas rather than losing an otherwise complete streamed result.
+			if textBuilder.Len() > 0 || finalText != "" || len(outputItems) > 0 {
+				model := strings.TrimSpace(gjson.GetBytes(data, "response.model").String())
+				finalResponse = backgroundResponseSyntheticCompletedResponse(fallbackID, model, finalTextOrBuilder(finalText, &textBuilder), outputItems)
+			}
+		}
+	})
+	if finalResponse == nil || !json.Valid(finalResponse) {
+		return nil, false
+	}
+	finalResponse = backgroundResponseNormalizeCompletedResponse(finalResponse, fallbackID, finalTextOrBuilder(finalText, &textBuilder), outputItems)
+	return json.RawMessage(finalResponse), true
+}
+
+func backgroundResponseNormalizeCompletedResponse(response []byte, fallbackID, outputText string, outputItems []json.RawMessage) []byte {
+	if !gjson.ValidBytes(response) {
+		return response
+	}
+	updated := response
+	if strings.TrimSpace(gjson.GetBytes(updated, "id").String()) == "" && strings.TrimSpace(fallbackID) != "" {
+		if next, err := sjson.SetBytes(updated, "id", fallbackID); err == nil {
+			updated = next
+		}
+	}
+	if strings.TrimSpace(gjson.GetBytes(updated, "object").String()) == "" {
+		if next, err := sjson.SetBytes(updated, "object", "response"); err == nil {
+			updated = next
+		}
+	}
+	if strings.TrimSpace(gjson.GetBytes(updated, "status").String()) == "" {
+		if next, err := sjson.SetBytes(updated, "status", service.BackgroundResponseStatusCompleted); err == nil {
+			updated = next
+		}
+	}
+	output := gjson.GetBytes(updated, "output")
+	if output.Exists() && output.IsArray() && len(output.Array()) > 0 {
+		return updated
+	}
+	if len(outputItems) > 0 {
+		if encoded, err := json.Marshal(outputItems); err == nil {
+			if next, setErr := sjson.SetRawBytes(updated, "output", encoded); setErr == nil {
+				updated = next
+			}
+		}
+		return updated
+	}
+	if strings.TrimSpace(outputText) == "" {
+		return updated
+	}
+	if encoded := backgroundResponseOutputTextItems(outputText); len(encoded) > 0 {
+		if next, err := sjson.SetRawBytes(updated, "output", encoded); err == nil {
+			updated = next
+		}
+	}
+	return updated
+}
+
+func backgroundResponseSyntheticCompletedResponse(id, model, outputText string, outputItems []json.RawMessage) []byte {
+	resp := gin.H{
+		"id":         strings.TrimSpace(id),
+		"object":     "response",
+		"status":     service.BackgroundResponseStatusCompleted,
+		"output":     []any{},
+		"error":      nil,
+		"model":      strings.TrimSpace(model),
+		"background": true,
+	}
+	body, _ := json.Marshal(resp)
+	return backgroundResponseNormalizeCompletedResponse(body, id, outputText, outputItems)
+}
+
+func backgroundResponseOutputTextItems(text string) []byte {
+	type contentItem struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	type outputItem struct {
+		Type    string        `json:"type"`
+		Role    string        `json:"role"`
+		Status  string        `json:"status,omitempty"`
+		Content []contentItem `json:"content"`
+	}
+	encoded, _ := json.Marshal([]outputItem{{
+		Type:   "message",
+		Role:   "assistant",
+		Status: service.BackgroundResponseStatusCompleted,
+		Content: []contentItem{{
+			Type: "output_text",
+			Text: text,
+		}},
+	}})
+	return encoded
+}
+
+func finalTextOrBuilder(finalText string, builder *strings.Builder) string {
+	if finalText != "" {
+		return finalText
+	}
+	if builder == nil {
+		return ""
+	}
+	return builder.String()
+}
+
+func backgroundResponseErrorFromSSE(body []byte) (json.RawMessage, bool) {
+	if len(body) == 0 {
+		return nil, false
+	}
+	var taskErr json.RawMessage
+	backgroundResponseForEachSSEDataPayload(body, func(data []byte) {
+		if taskErr != nil || len(data) == 0 || !gjson.ValidBytes(data) {
+			return
+		}
+		eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
+		switch eventType {
+		case "response.failed":
+			for _, path := range []string{"response.error", "error"} {
+				value := gjson.GetBytes(data, path)
+				if value.Exists() && value.IsObject() && value.Raw != "" {
+					taskErr = json.RawMessage(value.Raw)
+					return
+				}
+			}
+			taskErr = backgroundResponseErrorPayload("upstream_error", backgroundResponseSSEErrorMessage(data, "background response failed"))
+		case "response.incomplete":
+			taskErr = backgroundResponseErrorPayload("incomplete_error", backgroundResponseSSEErrorMessage(data, "background response incomplete"))
+		case "response.cancelled", "response.canceled":
+			taskErr = backgroundResponseErrorPayload("cancelled_error", backgroundResponseSSEErrorMessage(data, "background response cancelled"))
+		}
+	})
+	return taskErr, taskErr != nil
+}
+
+func backgroundResponseSSEErrorMessage(data []byte, fallback string) string {
+	for _, path := range []string{"response.error.message", "error.message", "message", "response.incomplete_details.reason"} {
+		if msg := strings.TrimSpace(gjson.GetBytes(data, path).String()); msg != "" {
+			return msg
+		}
+	}
+	return fallback
+}
+
+func backgroundResponseForEachSSEDataPayload(body []byte, fn func([]byte)) {
+	if fn == nil || len(body) == 0 {
+		return
+	}
+	var lines []string
+	flush := func() {
+		if len(lines) == 0 {
+			return
+		}
+		backgroundResponseEmitSSEDataPayloads(lines, fn)
+		lines = lines[:0]
+	}
+	for _, rawLine := range strings.Split(string(body), "\n") {
+		line := strings.TrimRight(rawLine, "\r")
+		if data, ok := backgroundResponseSSEDataLine(line); ok {
+			lines = append(lines, data)
+			continue
+		}
+		if strings.TrimSpace(line) == "" {
+			flush()
+		}
+	}
+	flush()
+}
+
+func backgroundResponseEmitSSEDataPayloads(lines []string, fn func([]byte)) {
+	if len(lines) == 0 || fn == nil {
+		return
+	}
+	if len(lines) == 1 {
+		backgroundResponseEmitSSEDataPayload(lines[0], fn)
+		return
+	}
+	joined := strings.Join(lines, "\n")
+	if gjson.Valid(joined) {
+		backgroundResponseEmitSSEDataPayload(joined, fn)
+		return
+	}
+	for _, line := range lines {
+		backgroundResponseEmitSSEDataPayload(line, fn)
+	}
+}
+
+func backgroundResponseEmitSSEDataPayload(data string, fn func([]byte)) {
+	data = strings.TrimSpace(data)
+	if data == "" || data == "[DONE]" {
+		return
+	}
+	fn([]byte(data))
+}
+
+func backgroundResponseSSEDataLine(line string) (string, bool) {
+	if !strings.HasPrefix(line, "data:") {
+		return "", false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(line, "data:")), true
 }
 
 func backgroundResponseError(c *gin.Context, err error) {

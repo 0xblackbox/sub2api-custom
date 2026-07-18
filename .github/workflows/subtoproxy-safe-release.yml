@@ -40,9 +40,9 @@ jobs:
           fi
           revision=1
           # The first protected release supersedes the already deployed local
-          # custom.2 build. Every later official base starts at custom.1.
+          # custom.3 build. Every later official base starts at custom.1.
           if [[ "$official_version" == "0.1.160" ]]; then
-            revision=3
+            revision=4
           fi
           custom_version="${official_version}-custom.${revision}"
           custom_tag="v${custom_version}"
@@ -139,4 +139,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$CUSTOM_TAG (SubtoProxy safe channel)" \
-            --notes "Based on official ${OFFICIAL_TAG}. Includes the SubtoProxy background-response compatibility layer, custom-only updater, checksum verification, tests, and one-click automatic restart."
+            --notes "Based on official ${OFFICIAL_TAG}. Includes the SubtoProxy background-response streaming-drain compatibility layer, custom-only updater, checksum verification, tests, and one-click automatic restart."

@@ -17,6 +17,7 @@ concurrency:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout custom channel
         uses: actions/checkout@v6
@@ -33,6 +34,10 @@ jobs:
           set -euo pipefail
           official_tag="$(gh api repos/Wei-Shaw/sub2api/releases/latest --jq .tag_name)"
           official_version="${official_tag#v}"
+          if [[ ! "$official_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Refusing unexpected official version: $official_tag" >&2
+            exit 1
+          fi
           revision=1
           # The first protected release supersedes the already deployed local
           # custom.2 build. Every later official base starts at custom.1.

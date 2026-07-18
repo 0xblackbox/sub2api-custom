@@ -153,6 +153,9 @@ func RegisterGatewayRoutes(
 		// OpenAI Responses API: auto-route based on group platform
 		gateway.POST("/responses", func(c *gin.Context) {
 			if isOpenAIResponsesCompatibleGatewayPlatform(c) {
+				if h.BackgroundResponse != nil && h.BackgroundResponse.TrySubmit(c) {
+					return
+				}
 				h.OpenAIGateway.Responses(c)
 				return
 			}
@@ -164,6 +167,14 @@ func RegisterGatewayRoutes(
 				return
 			}
 			h.Gateway.Responses(c)
+		})
+		gateway.GET("/responses/:response_id", func(c *gin.Context) {
+			if !isOpenAIResponsesCompatibleGatewayPlatform(c) || h.BackgroundResponse == nil {
+				service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalFeatureGate)
+				c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"type": "not_found_error", "message": "Response not found"}})
+				return
+			}
+			h.BackgroundResponse.Get(c)
 		})
 		gateway.POST("/alpha/search", h.OpenAIGateway.AlphaSearch)
 		gateway.GET("/responses", func(c *gin.Context) {
@@ -229,6 +240,9 @@ func RegisterGatewayRoutes(
 	// OpenAI Responses API（不带v1前缀的别名）— auto-route based on group platform
 	responsesHandler := func(c *gin.Context) {
 		if isOpenAIResponsesCompatibleGatewayPlatform(c) {
+			if h.BackgroundResponse != nil && h.BackgroundResponse.TrySubmit(c) {
+				return
+			}
 			h.OpenAIGateway.Responses(c)
 			return
 		}
@@ -236,6 +250,14 @@ func RegisterGatewayRoutes(
 	}
 	r.POST("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
 	r.POST("/responses/*subpath", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
+	r.GET("/responses/:response_id", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
+		if !isOpenAIResponsesCompatibleGatewayPlatform(c) || h.BackgroundResponse == nil {
+			service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalFeatureGate)
+			c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"type": "not_found_error", "message": "Response not found"}})
+			return
+		}
+		h.BackgroundResponse.Get(c)
+	})
 	r.POST("/alpha/search", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.OpenAIGateway.AlphaSearch)
 	r.GET("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
 		h.OpenAIGateway.ResponsesWebSocket(c)

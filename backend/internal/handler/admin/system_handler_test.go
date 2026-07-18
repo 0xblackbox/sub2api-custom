@@ -67,6 +67,8 @@ type systemUpdateResponseEnvelope struct {
 		CurrentVersion  string `json:"current_version"`
 		LatestVersion   string `json:"latest_version"`
 		OperationID     string `json:"operation_id"`
+		NeedRestart     bool   `json:"need_restart"`
+		AutoRestart     bool   `json:"auto_restart"`
 	} `json:"data"`
 }
 
@@ -88,12 +90,41 @@ func newSystemHandlerTestRouter(t *testing.T, updateSvc *systemHandlerUpdateServ
 		SystemOperationTTL: time.Minute,
 	})
 	handler := NewSystemHandler(updateSvc, lockSvc)
+	// Never exit the unit-test process when exercising a successful update.
+	handler.restartAfterUpdate = func() {}
 
 	router := gin.New()
 	router.POST("/api/v1/admin/system/update", handler.PerformUpdate)
 	router.POST("/api/v1/admin/system/rollback", handler.Rollback)
 	router.GET("/api/v1/admin/system/rollback-versions", handler.GetRollbackVersions)
 	return router
+}
+
+func TestSystemHandlerPerformUpdateSchedulesAutomaticRestart(t *testing.T) {
+	updateSvc := &systemHandlerUpdateServiceStub{}
+	repo := newMemoryIdempotencyRepoStub()
+
+	gini := gin.New()
+	lockSvc := service.NewSystemOperationLockService(repo, service.IdempotencyConfig{
+		ProcessingTimeout:  time.Second,
+		SystemOperationTTL: time.Minute,
+	})
+	handler := NewSystemHandler(updateSvc, lockSvc)
+	restartScheduled := false
+	handler.restartAfterUpdate = func() { restartScheduled = true }
+	gini.POST("/api/v1/admin/system/update", handler.PerformUpdate)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/system/update", nil)
+	req.Header.Set("Idempotency-Key", "automatic-restart")
+	gini.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.True(t, restartScheduled)
+	var body systemUpdateResponseEnvelope
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.True(t, body.Data.NeedRestart)
+	require.True(t, body.Data.AutoRestart)
 }
 
 func requireSystemLockStatus(t *testing.T, repo *memoryIdempotencyRepoStub, wantStatus string) {

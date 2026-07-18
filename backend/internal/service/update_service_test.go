@@ -69,6 +69,40 @@ func TestUpdateServicePerformUpdateNoUpdateReturnsSentinel(t *testing.T) {
 	require.ErrorIs(t, err, ErrNoUpdateAvailable)
 }
 
+func TestUpdateServiceCustomBuildRejectsOfficialBinaryReplacement(t *testing.T) {
+	svc := NewUpdateService(
+		&updateServiceCacheStub{},
+		&updateServiceGitHubClientStub{},
+		"0.1.160-custom.1",
+		"source",
+	)
+
+	require.ErrorIs(t, svc.PerformUpdate(context.Background()), ErrCustomBuildUpdateDisabled)
+	require.ErrorIs(t, svc.Rollback(), ErrCustomBuildUpdateDisabled)
+	require.ErrorIs(t, svc.RollbackToVersion(context.Background(), "0.1.159"), ErrCustomBuildUpdateDisabled)
+}
+
+func TestCompareVersionsOrdersCustomChannelRevisions(t *testing.T) {
+	tests := []struct {
+		current string
+		latest  string
+		want    int
+	}{
+		{current: "0.1.160-custom.2", latest: "0.1.160-custom.3", want: -1},
+		{current: "v0.1.160-custom.10", latest: "0.1.160-custom.3", want: 1},
+		{current: "0.1.160", latest: "0.1.160-custom.1", want: -1},
+		{current: "0.1.160-custom.3", latest: "0.1.161-custom.1", want: -1},
+		{current: "0.1.161-custom.1", latest: "0.1.160-custom.99", want: 1},
+		{current: "0.1.160-custom.3+build.7", latest: "0.1.160-custom.3", want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.current+"_vs_"+tt.latest, func(t *testing.T) {
+			require.Equal(t, tt.want, compareVersions(tt.current, tt.latest))
+		})
+	}
+}
+
 func newRollbackTestService(current string, releases []*GitHubRelease) *UpdateService {
 	return NewUpdateService(
 		&updateServiceCacheStub{},

@@ -25,12 +25,17 @@ import (
 var (
 	ErrNoUpdateAvailable         = infraerrors.Conflict("ALREADY_UP_TO_DATE", "no update available; current version is latest")
 	ErrRollbackVersionNotAllowed = infraerrors.BadRequest("ROLLBACK_VERSION_NOT_ALLOWED", "version is not in the allowed rollback list")
+	ErrCustomBuildUpdateDisabled = infraerrors.Conflict("CUSTOM_BUILD_UPDATE_DISABLED", "direct official updates are disabled for this custom build; use the SubtoProxy custom update channel")
 )
 
 const (
 	updateCacheKey = "update_check_cache"
 	updateCacheTTL = 1200 // 20 minutes
-	githubRepo     = "Wei-Shaw/sub2api"
+	// githubRepo is intentionally pinned to the SubtoProxy custom release
+	// channel. Release builds must never download the upstream binary directly,
+	// because doing so would overwrite the background-response compatibility
+	// layer carried by this fork.
+	githubRepo = "0xblackbox/sub2api-custom"
 
 	// Security: allowed download domains for updates
 	allowedDownloadHost = "github.com"
@@ -163,6 +168,9 @@ func (s *UpdateService) CheckUpdate(ctx context.Context, force bool) (*UpdateInf
 // PerformUpdate downloads and applies the update
 // Uses atomic file replacement pattern for safe in-place updates
 func (s *UpdateService) PerformUpdate(ctx context.Context) error {
+	if s == nil || s.buildType != "release" {
+		return ErrCustomBuildUpdateDisabled
+	}
 	info, err := s.CheckUpdate(ctx, true)
 	if err != nil {
 		return err
@@ -281,6 +289,9 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 
 // Rollback restores the previous version
 func (s *UpdateService) Rollback() error {
+	if s == nil || s.buildType != "release" {
+		return ErrCustomBuildUpdateDisabled
+	}
 	exePath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to get executable path: %w", err)
@@ -327,6 +338,9 @@ func (s *UpdateService) ListRollbackVersions(ctx context.Context) ([]RollbackVer
 // The target must be one of the versions returned by ListRollbackVersions;
 // anything else (including the current version) is rejected.
 func (s *UpdateService) RollbackToVersion(ctx context.Context, version string) error {
+	if s == nil || s.buildType != "release" {
+		return ErrCustomBuildUpdateDisabled
+	}
 	target := strings.TrimPrefix(strings.TrimSpace(version), "v")
 	if target == "" {
 		return ErrRollbackVersionNotAllowed
@@ -643,23 +657,50 @@ func compareVersions(current, latest string) int {
 	latestParts := parseVersion(latest)
 
 	for i := 0; i < 3; i++ {
-		if currentParts[i] < latestParts[i] {
+		if currentParts.core[i] < latestParts.core[i] {
 			return -1
 		}
-		if currentParts[i] > latestParts[i] {
+		if currentParts.core[i] > latestParts.core[i] {
 			return 1
 		}
+	}
+
+	// Custom channel releases use versions such as 0.1.160-custom.3. The old
+	// parser treated "160-custom" as zero, which made every custom revision
+	// look identical. For the same upstream base version, a custom build is
+	// considered newer than the unpatched upstream build, and custom revisions
+	// are ordered numerically.
+	if currentParts.customRevision < latestParts.customRevision {
+		return -1
+	}
+	if currentParts.customRevision > latestParts.customRevision {
+		return 1
 	}
 	return 0
 }
 
-func parseVersion(v string) [3]int {
+type parsedUpdateVersion struct {
+	core           [3]int
+	customRevision int
+}
+
+func parseVersion(v string) parsedUpdateVersion {
 	v = strings.TrimPrefix(v, "v")
-	parts := strings.Split(v, ".")
-	result := [3]int{0, 0, 0}
+	v = strings.SplitN(v, "+", 2)[0]
+	versionAndSuffix := strings.SplitN(v, "-", 2)
+	parts := strings.Split(versionAndSuffix[0], ".")
+	result := parsedUpdateVersion{}
 	for i := 0; i < len(parts) && i < 3; i++ {
 		if parsed, err := strconv.Atoi(parts[i]); err == nil {
-			result[i] = parsed
+			result.core[i] = parsed
+		}
+	}
+	if len(versionAndSuffix) == 2 {
+		suffixParts := strings.Split(versionAndSuffix[1], ".")
+		if len(suffixParts) == 2 && suffixParts[0] == "custom" {
+			if revision, err := strconv.Atoi(suffixParts[1]); err == nil && revision > 0 {
+				result.customRevision = revision
+			}
 		}
 	}
 	return result

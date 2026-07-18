@@ -765,6 +765,9 @@ async function handleUpdate() {
     needRestart.value = result.need_restart
     // Clear version cache to reflect update completed
     appStore.clearVersionCache()
+    if (result.auto_restart) {
+      beginRestartCountdown()
+    }
   } catch (error: unknown) {
     const err = error as { response?: { data?: { message?: string } }; message?: string }
     updateError.value = err.response?.data?.message || err.message || t('version.updateFailed')
@@ -862,6 +865,12 @@ async function handleRestart() {
     console.log('Service restarting...')
   }
 
+  beginRestartCountdown()
+}
+
+function beginRestartCountdown() {
+  restarting.value = true
+  restartCountdown.value = 8
   // Start countdown
   const countdownInterval = setInterval(() => {
     restartCountdown.value--

@@ -1,0 +1,133 @@
+name: SubtoProxy safe release
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Check four times a day. If the compatibility patch no longer applies or
+    # tests fail, the workflow stops before publishing anything.
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: subtoproxy-safe-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout custom channel
+        uses: actions/checkout@v6
+
+      - name: Resolve latest official release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          official_tag="$(gh api repos/Wei-Shaw/sub2api/releases/latest --jq .tag_name)"
+          official_version="${official_tag#v}"
+          revision=1
+          # The first protected release supersedes the already deployed local
+          # custom.2 build. Every later official base starts at custom.1.
+          if [[ "$official_version" == "0.1.160" ]]; then
+            revision=3
+          fi
+          custom_version="${official_version}-custom.${revision}"
+          custom_tag="v${custom_version}"
+          echo "official_tag=$official_tag" >> "$GITHUB_OUTPUT"
+          echo "official_version=$official_version" >> "$GITHUB_OUTPUT"
+          echo "custom_version=$custom_version" >> "$GITHUB_OUTPUT"
+          echo "custom_tag=$custom_tag" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$custom_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Safe release $custom_tag already exists."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout latest official source
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/Wei-Shaw/sub2api.git .safe-build/upstream
+          git -C .safe-build/upstream fetch --depth=1 origin "refs/tags/${{ steps.version.outputs.official_tag }}:refs/tags/${{ steps.version.outputs.official_tag }}"
+          git -C .safe-build/upstream checkout --detach "${{ steps.version.outputs.official_tag }}"
+
+      - name: Apply compatibility layer (fail closed)
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git -C .safe-build/upstream apply --check ../../custom/patches/subtoproxy.patch
+          git -C .safe-build/upstream apply ../../custom/patches/subtoproxy.patch
+          grep -q '0xblackbox/sub2api-custom' .safe-build/upstream/backend/internal/service/update_service.go
+
+      - name: Setup pnpm
+        if: steps.version.outputs.skip != 'true'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: .safe-build/upstream/frontend/pnpm-lock.yaml
+
+      - name: Build embedded frontend
+        if: steps.version.outputs.skip != 'true'
+        working-directory: .safe-build/upstream/frontend
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Setup Go
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: .safe-build/upstream/backend/go.mod
+          cache-dependency-path: .safe-build/upstream/backend/go.sum
+
+      - name: Run compatibility tests
+        if: steps.version.outputs.skip != 'true'
+        working-directory: .safe-build/upstream/backend
+        run: |
+          set -euo pipefail
+          go test -tags=unit ./internal/service ./internal/repository ./internal/handler ./internal/server/middleware
+
+      - name: Build release archive and checksum
+        if: steps.version.outputs.skip != 'true'
+        working-directory: .safe-build/upstream/backend
+        env:
+          CUSTOM_VERSION: ${{ steps.version.outputs.custom_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -tags embed -trimpath \
+            -ldflags="-s -w -X main.Version=${CUSTOM_VERSION} -X main.Commit=${GITHUB_SHA} -X main.BuildType=release" \
+            -o dist/package/sub2api ./cmd/server
+          tar -C dist/package -czf dist/sub2api_linux_amd64.tar.gz sub2api
+          (cd dist && sha256sum sub2api_linux_amd64.tar.gz > checksums.txt)
+
+      - name: Publish safe custom release
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUSTOM_TAG: ${{ steps.version.outputs.custom_tag }}
+          OFFICIAL_TAG: ${{ steps.version.outputs.official_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$CUSTOM_TAG" \
+            .safe-build/upstream/backend/dist/sub2api_linux_amd64.tar.gz \
+            .safe-build/upstream/backend/dist/checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$CUSTOM_TAG (SubtoProxy safe channel)" \
+            --notes "Based on official ${OFFICIAL_TAG}. Includes the SubtoProxy background-response compatibility layer, custom-only updater, checksum verification, tests, and one-click automatic restart."

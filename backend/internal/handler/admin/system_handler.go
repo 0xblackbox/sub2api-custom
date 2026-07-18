@@ -18,8 +18,9 @@ import (
 
 // SystemHandler handles system-related operations
 type SystemHandler struct {
-	updateSvc systemUpdateService
-	lockSvc   *service.SystemOperationLockService
+	updateSvc          systemUpdateService
+	lockSvc            *service.SystemOperationLockService
+	restartAfterUpdate func()
 }
 
 type systemUpdateService interface {
@@ -35,6 +36,14 @@ func NewSystemHandler(updateSvc systemUpdateService, lockSvc *service.SystemOper
 	return &SystemHandler{
 		updateSvc: updateSvc,
 		lockSvc:   lockSvc,
+		restartAfterUpdate: func() {
+			go func() {
+				// Leave enough time for Gin to flush the success response before
+				// systemd restarts the process.
+				time.Sleep(750 * time.Millisecond)
+				sysutil.RestartServiceAsync()
+			}()
+		},
 	}
 }
 
@@ -95,10 +104,14 @@ func (h *SystemHandler) PerformUpdate(c *gin.Context) {
 			return nil, err
 		}
 		succeeded = true
+		if h.restartAfterUpdate != nil {
+			h.restartAfterUpdate()
+		}
 
 		return gin.H{
-			"message":      "Update completed. Please restart the service.",
+			"message":      "Update completed. Service is restarting automatically.",
 			"need_restart": true,
+			"auto_restart": true,
 			"operation_id": lock.OperationID(),
 		}, nil
 	})

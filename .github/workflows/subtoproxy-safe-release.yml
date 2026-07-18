@@ -20,6 +20,10 @@ jobs:
     steps:
       - name: Checkout custom channel
         uses: actions/checkout@v6
+        with:
+          # Do not leave the write-capable release token in git config while
+          # building and testing code obtained from the upstream repository.
+          persist-credentials: false
 
       - name: Resolve latest official release
         id: version

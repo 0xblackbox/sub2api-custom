@@ -1,5 +1,5 @@
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
-index 39354c1..19b4ce8 100644
+index 39354c1c..19b4ce81 100644
 --- a/backend/cmd/server/wire_gen.go
 +++ b/backend/cmd/server/wire_gen.go
 @@ -285,6 +285,9 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
@@ -22,7 +22,7 @@ index 39354c1..19b4ce8 100644
  	adminAuthMiddleware := middleware.NewAdminAuthMiddleware(authService, userService, settingService, auditLogService)
  	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, subscriptionService, configConfig)
 diff --git a/backend/internal/handler/admin/system_handler.go b/backend/internal/handler/admin/system_handler.go
-index 49bd5bc..f4bdd3b 100644
+index 49bd5bc2..f4bdd3bc 100644
 --- a/backend/internal/handler/admin/system_handler.go
 +++ b/backend/internal/handler/admin/system_handler.go
 @@ -18,8 +18,9 @@ import (
@@ -69,7 +69,7 @@ index 49bd5bc..f4bdd3b 100644
  		}, nil
  	})
 diff --git a/backend/internal/handler/admin/system_handler_test.go b/backend/internal/handler/admin/system_handler_test.go
-index 78e24d0..ad02171 100644
+index 78e24d00..ad021716 100644
 --- a/backend/internal/handler/admin/system_handler_test.go
 +++ b/backend/internal/handler/admin/system_handler_test.go
 @@ -67,6 +67,8 @@ type systemUpdateResponseEnvelope struct {
@@ -126,10 +126,10 @@ index 78e24d0..ad02171 100644
  	repo.mu.Lock()
 diff --git a/backend/internal/handler/background_response_handler.go b/backend/internal/handler/background_response_handler.go
 new file mode 100644
-index 0000000..8245aa9
+index 00000000..f2373762
 --- /dev/null
 +++ b/backend/internal/handler/background_response_handler.go
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,695 @@
 +package handler
 +
 +import (
@@ -503,10 +503,48 @@ index 0000000..8245aa9
 +	}
 +	key := backgroundResponseOutputItemKey(item)
 +	if _, ok := seenItems[key]; ok {
++		backgroundResponseReplaceOutputItemIfRicher(item, key, outputItems)
 +		return
 +	}
 +	seenItems[key] = struct{}{}
 +	*outputItems = append(*outputItems, json.RawMessage(item.Raw))
++}
++
++func backgroundResponseReplaceOutputItemIfRicher(candidate gjson.Result, key string, outputItems *[]json.RawMessage) {
++	if outputItems == nil || strings.TrimSpace(key) == "" || !candidate.Exists() || candidate.Raw == "" {
++		return
++	}
++	for idx, raw := range *outputItems {
++		if len(raw) == 0 || !json.Valid(raw) {
++			continue
++		}
++		current := gjson.ParseBytes(raw)
++		if backgroundResponseOutputItemKey(current) != key {
++			continue
++		}
++		if backgroundResponseOutputItemIsRicher(candidate, current) {
++			(*outputItems)[idx] = json.RawMessage(candidate.Raw)
++		}
++		return
++	}
++}
++
++func backgroundResponseOutputItemIsRicher(candidate, current gjson.Result) bool {
++	if !candidate.Exists() || !current.Exists() {
++		return false
++	}
++	candidateStatus := strings.TrimSpace(candidate.Get("status").String())
++	currentStatus := strings.TrimSpace(current.Get("status").String())
++	if candidateStatus == "completed" && currentStatus != "completed" {
++		return true
++	}
++	if candidate.Get("action.sources").Exists() && !current.Get("action.sources").Exists() {
++		return true
++	}
++	if candidate.Get("action").Exists() && !current.Get("action").Exists() {
++		return true
++	}
++	return len(candidate.Raw) > len(current.Raw) && currentStatus != "completed"
 +}
 +
 +func backgroundResponseOutputItemKey(item gjson.Result) string {
@@ -561,6 +599,7 @@ index 0000000..8245aa9
 +		}
 +		key := backgroundResponseOutputItemKey(item)
 +		if _, ok := seen[key]; ok {
++			backgroundResponseReplaceOutputItemIfRicher(item, key, &merged)
 +			continue
 +		}
 +		seen[key] = struct{}{}
@@ -788,10 +827,10 @@ index 0000000..8245aa9
 +}
 diff --git a/backend/internal/handler/background_response_handler_test.go b/backend/internal/handler/background_response_handler_test.go
 new file mode 100644
-index 0000000..0852b75
+index 00000000..058ab43d
 --- /dev/null
 +++ b/backend/internal/handler/background_response_handler_test.go
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,234 @@
 +package handler
 +
 +import (
@@ -922,6 +961,24 @@ index 0000000..0852b75
 +	require.Equal(t, int64(2), gjson.GetBytes(finalResponse, "output.#").Int())
 +}
 +
++func TestBackgroundResponseFinalResponseFromSSEPrefersCompletedWebSearchDoneSources(t *testing.T) {
++	body := strings.Join([]string{
++		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"in_progress"}}`,
++		"",
++		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"OpenAI","sources":[{"type":"url","url":"https://platform.openai.com/docs/api-reference/responses-streaming","title":"Streaming"}]}}}`,
++		"",
++		`data: {"type":"response.completed","response":{"id":"resp_upstream","object":"response","status":"completed","output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`,
++		"",
++	}, "\n")
++
++	finalResponse, ok := backgroundResponseFinalResponseFromSSE([]byte(body), "resp_bg_test")
++	require.True(t, ok)
++	require.Equal(t, "web_search_call", gjson.GetBytes(finalResponse, "output.0.type").String())
++	require.Equal(t, "completed", gjson.GetBytes(finalResponse, "output.0.status").String())
++	require.Equal(t, "https://platform.openai.com/docs/api-reference/responses-streaming", gjson.GetBytes(finalResponse, "output.0.action.sources.0.url").String())
++	require.Equal(t, "message", gjson.GetBytes(finalResponse, "output.1.type").String())
++}
++
 +func TestBackgroundResponseStreamingFailedEventBecomesTerminalFailure(t *testing.T) {
 +	gin.SetMode(gin.TestMode)
 +	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
@@ -1009,7 +1066,7 @@ index 0000000..0852b75
 +	return result
 +}
 diff --git a/backend/internal/handler/handler.go b/backend/internal/handler/handler.go
-index 13d3076..9a2a7e2 100644
+index 13d3076b..9a2a7e29 100644
 --- a/backend/internal/handler/handler.go
 +++ b/backend/internal/handler/handler.go
 @@ -45,24 +45,25 @@ type AdminHandlers struct {
@@ -1057,7 +1114,7 @@ index 13d3076..9a2a7e2 100644
  
  // BuildInfo contains build-time information
 diff --git a/backend/internal/handler/openai_gateway_handler.go b/backend/internal/handler/openai_gateway_handler.go
-index 602b971..33b47ce 100644
+index 602b971f..33b47ce0 100644
 --- a/backend/internal/handler/openai_gateway_handler.go
 +++ b/backend/internal/handler/openai_gateway_handler.go
 @@ -47,7 +47,38 @@ type grokMediaEligibilityProber interface {
@@ -1293,7 +1350,7 @@ index 602b971..33b47ce 100644
  
  // openAICompactKeepaliveInterval 复用流式 keepalive 配置作为 compact 下游
 diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
-index 54d82a6..45c75ae 100644
+index 54d82a69..45c75ae5 100644
 --- a/backend/internal/handler/wire.go
 +++ b/backend/internal/handler/wire.go
 @@ -181,29 +181,31 @@ func ProvideHandlers(
@@ -1356,7 +1413,7 @@ index 54d82a6..45c75ae 100644
  	// Admin handlers
 diff --git a/backend/internal/repository/background_response_task_store.go b/backend/internal/repository/background_response_task_store.go
 new file mode 100644
-index 0000000..5ae0e2e
+index 00000000..5ae0e2e4
 --- /dev/null
 +++ b/backend/internal/repository/background_response_task_store.go
 @@ -0,0 +1,48 @@
@@ -1410,7 +1467,7 @@ index 0000000..5ae0e2e
 +}
 diff --git a/backend/internal/repository/background_response_task_store_test.go b/backend/internal/repository/background_response_task_store_test.go
 new file mode 100644
-index 0000000..d21a376
+index 00000000..d21a376e
 --- /dev/null
 +++ b/backend/internal/repository/background_response_task_store_test.go
 @@ -0,0 +1,44 @@
@@ -1459,7 +1516,7 @@ index 0000000..d21a376
 +	require.ErrorIs(t, err, service.ErrBackgroundResponseNotFound)
 +}
 diff --git a/backend/internal/repository/wire.go b/backend/internal/repository/wire.go
-index 0bfd2d0..ceae07c 100644
+index 0bfd2d00..ceae07ce 100644
 --- a/backend/internal/repository/wire.go
 +++ b/backend/internal/repository/wire.go
 @@ -121,6 +121,7 @@ var ProviderSet = wire.NewSet(
@@ -1471,7 +1528,7 @@ index 0bfd2d0..ceae07c 100644
  	NewBatchImageDownloadLimiter,
  	NewLeaderLockCache,
 diff --git a/backend/internal/server/middleware/api_key_auth.go b/backend/internal/server/middleware/api_key_auth.go
-index bcec397..345b7bd 100644
+index bcec3976..345b7bdf 100644
 --- a/backend/internal/server/middleware/api_key_auth.go
 +++ b/backend/internal/server/middleware/api_key_auth.go
 @@ -28,7 +28,7 @@ func NewAPIKeyAuthMiddleware(apiKeyService *service.APIKeyService, subscriptionS
@@ -1512,7 +1569,7 @@ index bcec397..345b7bd 100644
  func GetAPIKeyFromContext(c *gin.Context) (*service.APIKey, bool) {
  	value, exists := c.Get(string(ContextKeyAPIKey))
 diff --git a/backend/internal/server/middleware/api_key_auth_image_task_test.go b/backend/internal/server/middleware/api_key_auth_image_task_test.go
-index 653fd8b..aa0bfd7 100644
+index 653fd8ba..aa0bfd76 100644
 --- a/backend/internal/server/middleware/api_key_auth_image_task_test.go
 +++ b/backend/internal/server/middleware/api_key_auth_image_task_test.go
 @@ -13,3 +13,12 @@ func TestIsAsyncImageTaskRead(t *testing.T) {
@@ -1529,7 +1586,7 @@ index 653fd8b..aa0bfd7 100644
 +	require.False(t, isBackgroundResponseRead(http.MethodGet, "/v1/responses-archive/resp_bg_123"))
 +}
 diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
-index 07b8f1e..5fe79d8 100644
+index 07b8f1eb..5fe79d8e 100644
 --- a/backend/internal/server/routes/gateway.go
 +++ b/backend/internal/server/routes/gateway.go
 @@ -167,6 +167,9 @@ func RegisterGatewayRoutes(
@@ -1584,7 +1641,7 @@ index 07b8f1e..5fe79d8 100644
  		h.OpenAIGateway.ResponsesWebSocket(c)
 diff --git a/backend/internal/service/background_response_task.go b/backend/internal/service/background_response_task.go
 new file mode 100644
-index 0000000..c6cce6d
+index 00000000..c6cce6d4
 --- /dev/null
 +++ b/backend/internal/service/background_response_task.go
 @@ -0,0 +1,185 @@
@@ -1775,7 +1832,7 @@ index 0000000..c6cce6d
 +}
 diff --git a/backend/internal/service/background_response_task_test.go b/backend/internal/service/background_response_task_test.go
 new file mode 100644
-index 0000000..1742103
+index 00000000..17421037
 --- /dev/null
 +++ b/backend/internal/service/background_response_task_test.go
 @@ -0,0 +1,99 @@
@@ -1879,7 +1936,7 @@ index 0000000..1742103
 +	require.ErrorIs(t, err, ErrBackgroundResponseUnavailable)
 +}
 diff --git a/backend/internal/service/openai_gateway_forward.go b/backend/internal/service/openai_gateway_forward.go
-index 93697be..b32ed41 100644
+index 93697be7..b32ed413 100644
 --- a/backend/internal/service/openai_gateway_forward.go
 +++ b/backend/internal/service/openai_gateway_forward.go
 @@ -15,6 +15,7 @@ import (
@@ -1923,7 +1980,7 @@ index 93697be..b32ed41 100644
  	}
  
 diff --git a/backend/internal/service/openai_gateway_response_handling.go b/backend/internal/service/openai_gateway_response_handling.go
-index 8857bdd..840b597 100644
+index 8857bdd5..840b5974 100644
 --- a/backend/internal/service/openai_gateway_response_handling.go
 +++ b/backend/internal/service/openai_gateway_response_handling.go
 @@ -1448,18 +1448,22 @@ func responsesStreamEventMayContributeToOutput(eventType string) bool {
@@ -2080,7 +2137,7 @@ index 8857bdd..840b597 100644
  // remote-compact result item ("compaction", upstream alias "compaction_summary").
  func isResponsesCompactionItemType(itemType string) bool {
 diff --git a/backend/internal/service/openai_gateway_responses_chat_fallback.go b/backend/internal/service/openai_gateway_responses_chat_fallback.go
-index 1082b02..027d2ac 100644
+index 1082b020..027d2ac1 100644
 --- a/backend/internal/service/openai_gateway_responses_chat_fallback.go
 +++ b/backend/internal/service/openai_gateway_responses_chat_fallback.go
 @@ -25,6 +25,11 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
@@ -2097,7 +2154,7 @@ index 1082b02..027d2ac 100644
  	if err := json.Unmarshal(body, &responsesReq); err != nil {
 diff --git a/backend/internal/service/openai_responses_native_contract.go b/backend/internal/service/openai_responses_native_contract.go
 new file mode 100644
-index 0000000..85f5be0
+index 00000000..85f5be06
 --- /dev/null
 +++ b/backend/internal/service/openai_responses_native_contract.go
 @@ -0,0 +1,117 @@
@@ -2220,7 +2277,7 @@ index 0000000..85f5be0
 +}
 diff --git a/backend/internal/service/openai_responses_web_search_test.go b/backend/internal/service/openai_responses_web_search_test.go
 new file mode 100644
-index 0000000..5b80fc5
+index 00000000..5b80fc5d
 --- /dev/null
 +++ b/backend/internal/service/openai_responses_web_search_test.go
 @@ -0,0 +1,172 @@
@@ -2397,7 +2454,7 @@ index 0000000..5b80fc5
 +	require.Equal(t, 3, result.usage.OutputTokens)
 +}
 diff --git a/backend/internal/service/update_service.go b/backend/internal/service/update_service.go
-index 82df3bb..a6b8857 100644
+index 82df3bb0..a6b88575 100644
 --- a/backend/internal/service/update_service.go
 +++ b/backend/internal/service/update_service.go
 @@ -25,12 +25,17 @@ import (
@@ -2507,7 +2564,7 @@ index 82df3bb..a6b8857 100644
  	}
  	return result
 diff --git a/backend/internal/service/update_service_test.go b/backend/internal/service/update_service_test.go
-index 243e25d..490b970 100644
+index 243e25d1..490b9709 100644
 --- a/backend/internal/service/update_service_test.go
 +++ b/backend/internal/service/update_service_test.go
 @@ -69,6 +69,40 @@ func TestUpdateServicePerformUpdateNoUpdateReturnsSentinel(t *testing.T) {
@@ -2552,7 +2609,7 @@ index 243e25d..490b970 100644
  	return NewUpdateService(
  		&updateServiceCacheStub{},
 diff --git a/backend/internal/service/wire.go b/backend/internal/service/wire.go
-index f3ee815..335aad0 100644
+index f3ee8153..335aad07 100644
 --- a/backend/internal/service/wire.go
 +++ b/backend/internal/service/wire.go
 @@ -681,6 +681,7 @@ var ProviderSet = wire.NewSet(
@@ -2564,7 +2621,7 @@ index f3ee815..335aad0 100644
  	NewBatchImagePublicService,
  	NewBatchImageDownloadService,
 diff --git a/frontend/src/api/admin/system.ts b/frontend/src/api/admin/system.ts
-index eb3db9b..2ecc1b7 100644
+index eb3db9b0..2ecc1b7a 100644
 --- a/frontend/src/api/admin/system.ts
 +++ b/frontend/src/api/admin/system.ts
 @@ -43,6 +43,7 @@ export async function checkUpdates(force = false): Promise<VersionInfo> {
@@ -2576,7 +2633,7 @@ index eb3db9b..2ecc1b7 100644
  
  export interface RollbackVersionInfo {
 diff --git a/frontend/src/components/common/VersionBadge.vue b/frontend/src/components/common/VersionBadge.vue
-index 7fd6294..5b4ffd0 100644
+index 7fd62947..5b4ffd09 100644
 --- a/frontend/src/components/common/VersionBadge.vue
 +++ b/frontend/src/components/common/VersionBadge.vue
 @@ -765,6 +765,9 @@ async function handleUpdate() {

@@ -128,6 +128,24 @@ func TestBackgroundResponseFinalResponseFromSSEPreservesWebSearchAddedSources(t 
 	require.Equal(t, int64(2), gjson.GetBytes(finalResponse, "output.#").Int())
 }
 
+func TestBackgroundResponseFinalResponseFromSSEPrefersCompletedWebSearchDoneSources(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"in_progress"}}`,
+		"",
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"OpenAI","sources":[{"type":"url","url":"https://platform.openai.com/docs/api-reference/responses-streaming","title":"Streaming"}]}}}`,
+		"",
+		`data: {"type":"response.completed","response":{"id":"resp_upstream","object":"response","status":"completed","output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`,
+		"",
+	}, "\n")
+
+	finalResponse, ok := backgroundResponseFinalResponseFromSSE([]byte(body), "resp_bg_test")
+	require.True(t, ok)
+	require.Equal(t, "web_search_call", gjson.GetBytes(finalResponse, "output.0.type").String())
+	require.Equal(t, "completed", gjson.GetBytes(finalResponse, "output.0.status").String())
+	require.Equal(t, "https://platform.openai.com/docs/api-reference/responses-streaming", gjson.GetBytes(finalResponse, "output.0.action.sources.0.url").String())
+	require.Equal(t, "message", gjson.GetBytes(finalResponse, "output.1.type").String())
+}
+
 func TestBackgroundResponseStreamingFailedEventBecomesTerminalFailure(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}

@@ -371,10 +371,48 @@ func backgroundResponseAppendOutputItem(item gjson.Result, outputItems *[]json.R
 	}
 	key := backgroundResponseOutputItemKey(item)
 	if _, ok := seenItems[key]; ok {
+		backgroundResponseReplaceOutputItemIfRicher(item, key, outputItems)
 		return
 	}
 	seenItems[key] = struct{}{}
 	*outputItems = append(*outputItems, json.RawMessage(item.Raw))
+}
+
+func backgroundResponseReplaceOutputItemIfRicher(candidate gjson.Result, key string, outputItems *[]json.RawMessage) {
+	if outputItems == nil || strings.TrimSpace(key) == "" || !candidate.Exists() || candidate.Raw == "" {
+		return
+	}
+	for idx, raw := range *outputItems {
+		if len(raw) == 0 || !json.Valid(raw) {
+			continue
+		}
+		current := gjson.ParseBytes(raw)
+		if backgroundResponseOutputItemKey(current) != key {
+			continue
+		}
+		if backgroundResponseOutputItemIsRicher(candidate, current) {
+			(*outputItems)[idx] = json.RawMessage(candidate.Raw)
+		}
+		return
+	}
+}
+
+func backgroundResponseOutputItemIsRicher(candidate, current gjson.Result) bool {
+	if !candidate.Exists() || !current.Exists() {
+		return false
+	}
+	candidateStatus := strings.TrimSpace(candidate.Get("status").String())
+	currentStatus := strings.TrimSpace(current.Get("status").String())
+	if candidateStatus == "completed" && currentStatus != "completed" {
+		return true
+	}
+	if candidate.Get("action.sources").Exists() && !current.Get("action.sources").Exists() {
+		return true
+	}
+	if candidate.Get("action").Exists() && !current.Get("action").Exists() {
+		return true
+	}
+	return len(candidate.Raw) > len(current.Raw) && currentStatus != "completed"
 }
 
 func backgroundResponseOutputItemKey(item gjson.Result) string {
@@ -429,6 +467,7 @@ func backgroundResponseMergeOutputItems(response []byte, collected []json.RawMes
 		}
 		key := backgroundResponseOutputItemKey(item)
 		if _, ok := seen[key]; ok {
+			backgroundResponseReplaceOutputItemIfRicher(item, key, &merged)
 			continue
 		}
 		seen[key] = struct{}{}

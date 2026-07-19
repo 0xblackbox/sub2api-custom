@@ -45,7 +45,7 @@ jobs:
             revision=4
           fi
           if [[ "$official_version" == "0.1.161" ]]; then
-            revision=3
+            revision=4
           fi
           custom_version="${official_version}-custom.${revision}"
           custom_tag="v${custom_version}"

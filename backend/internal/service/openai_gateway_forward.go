@@ -15,6 +15,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"go.uber.org/zap"
 )
 
 // Forward forwards request to OpenAI API
@@ -76,12 +77,31 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	requestView := newOpenAIRequestView(body)
 	reqModel, reqStream, promptCacheKey := requestView.Model, requestView.Stream, requestView.PromptCacheKey
 	originalModel := reqModel
+	nativeContract := OpenAIResponsesNativeContract(body)
 
 	if account.Platform == PlatformGrok {
 		return s.forwardGrokResponses(ctx, c, account, body, originalModel, reqStream, startTime)
 	}
 
 	if account.Type == AccountTypeAPIKey && !openai_compat.ShouldUseResponsesAPI(account.Extra) {
+		if nativeContract.RequiresNativeResponses {
+			if c != nil {
+				c.Set("openai_responses_requires_native", true)
+				c.Set("openai_responses_has_web_search", nativeContract.HasHostedWebSearch)
+				c.Set("openai_responses_include_web_search_sources", nativeContract.RequestsWebSearchSources)
+			}
+			logger.L().Warn("openai responses: refusing chat completions fallback for native-only request",
+				zap.Int64("account_id", account.ID),
+				zap.String("account_name", account.Name),
+				zap.String("original_model", originalModel),
+				zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
+				zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
+				zap.Bool("background", nativeContract.Background),
+				zap.String("tool_choice", nativeContract.ToolChoice),
+			)
+			writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "upstream_configuration_error", "Selected upstream only supports Chat Completions fallback and cannot preserve native Responses hosted tool output")
+			return nil, errors.New("responses request requires native /v1/responses upstream")
+		}
 		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body)
 	}
 

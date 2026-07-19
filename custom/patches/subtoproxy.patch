@@ -1,5 +1,5 @@
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
-index 39354c1cf..19b4ce819 100644
+index 39354c1..19b4ce8 100644
 --- a/backend/cmd/server/wire_gen.go
 +++ b/backend/cmd/server/wire_gen.go
 @@ -285,6 +285,9 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
@@ -22,7 +22,7 @@ index 39354c1cf..19b4ce819 100644
  	adminAuthMiddleware := middleware.NewAdminAuthMiddleware(authService, userService, settingService, auditLogService)
  	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, subscriptionService, configConfig)
 diff --git a/backend/internal/handler/admin/system_handler.go b/backend/internal/handler/admin/system_handler.go
-index 49bd5bc20..f4bdd3bc5 100644
+index 49bd5bc..f4bdd3b 100644
 --- a/backend/internal/handler/admin/system_handler.go
 +++ b/backend/internal/handler/admin/system_handler.go
 @@ -18,8 +18,9 @@ import (
@@ -69,7 +69,7 @@ index 49bd5bc20..f4bdd3bc5 100644
  		}, nil
  	})
 diff --git a/backend/internal/handler/admin/system_handler_test.go b/backend/internal/handler/admin/system_handler_test.go
-index 78e24d008..ad0217163 100644
+index 78e24d0..ad02171 100644
 --- a/backend/internal/handler/admin/system_handler_test.go
 +++ b/backend/internal/handler/admin/system_handler_test.go
 @@ -67,6 +67,8 @@ type systemUpdateResponseEnvelope struct {
@@ -126,7 +126,7 @@ index 78e24d008..ad0217163 100644
  	repo.mu.Lock()
 diff --git a/backend/internal/handler/background_response_handler.go b/backend/internal/handler/background_response_handler.go
 new file mode 100644
-index 000000000..cb112a1fb
+index 0000000..cb112a1
 --- /dev/null
 +++ b/backend/internal/handler/background_response_handler.go
 @@ -0,0 +1,576 @@
@@ -708,7 +708,7 @@ index 000000000..cb112a1fb
 +}
 diff --git a/backend/internal/handler/background_response_handler_test.go b/backend/internal/handler/background_response_handler_test.go
 new file mode 100644
-index 000000000..852b01c85
+index 0000000..852b01c
 --- /dev/null
 +++ b/backend/internal/handler/background_response_handler_test.go
 @@ -0,0 +1,197 @@
@@ -910,7 +910,7 @@ index 000000000..852b01c85
 +	return result
 +}
 diff --git a/backend/internal/handler/handler.go b/backend/internal/handler/handler.go
-index 13d3076b5..9a2a7e294 100644
+index 13d3076..9a2a7e2 100644
 --- a/backend/internal/handler/handler.go
 +++ b/backend/internal/handler/handler.go
 @@ -45,24 +45,25 @@ type AdminHandlers struct {
@@ -957,8 +957,244 @@ index 13d3076b5..9a2a7e294 100644
  }
  
  // BuildInfo contains build-time information
+diff --git a/backend/internal/handler/openai_gateway_handler.go b/backend/internal/handler/openai_gateway_handler.go
+index 602b971..33b47ce 100644
+--- a/backend/internal/handler/openai_gateway_handler.go
++++ b/backend/internal/handler/openai_gateway_handler.go
+@@ -47,7 +47,38 @@ type grokMediaEligibilityProber interface {
+ 	ProbeMediaEligibility(ctx context.Context, accountID int64) (bool, string, error)
+ }
+ 
+-const maxOpenAIFirstOutputTimeoutSwitches = 1
++const (
++	maxOpenAIFirstOutputTimeoutSwitches = 1
++
++	openAIRateLimitLayerContextKey      = "openai_rate_limit_layer"
++	openAIRateLimitUpstreamRequestIDKey = "openai_rate_limit_upstream_request_id"
++	openAIRateLimitUpstreamStatusKey    = "openai_rate_limit_upstream_status"
++	openAIRateLimitLayerHeader          = "X-RateLimit-Layer"
++	openAIUpstreamStatusCodeHeader      = "X-Upstream-Status-Code"
++	openAIUpstreamRequestIDHeader       = "X-Upstream-Request-ID"
++)
++
++func markOpenAIRateLimitLayer(c *gin.Context, layer string, upstreamStatus int, upstreamRequestID string) {
++	if c == nil {
++		return
++	}
++	layer = strings.TrimSpace(layer)
++	if layer == "" {
++		return
++	}
++	c.Set(openAIRateLimitLayerContextKey, layer)
++	c.Header(openAIRateLimitLayerHeader, layer)
++	if upstreamStatus > 0 {
++		status := strconv.Itoa(upstreamStatus)
++		c.Set(openAIRateLimitUpstreamStatusKey, status)
++		c.Header(openAIUpstreamStatusCodeHeader, status)
++	}
++	upstreamRequestID = strings.TrimSpace(upstreamRequestID)
++	if upstreamRequestID != "" && !strings.ContainsAny(upstreamRequestID, "\r\n") && len(upstreamRequestID) <= 128 {
++		c.Set(openAIRateLimitUpstreamRequestIDKey, upstreamRequestID)
++		c.Header(openAIUpstreamRequestIDHeader, upstreamRequestID)
++	}
++}
+ 
+ func openAIForwardSucceededForScheduling(result *service.OpenAIForwardResult) bool {
+ 	return result.SucceededForScheduling()
+@@ -252,7 +283,25 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
+ 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
+ 		return
+ 	}
+-	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
++	nativeContract := service.OpenAIResponsesNativeContract(body)
++	if nativeContract.RequiresNativeResponses {
++		c.Set("openai_responses_requires_native", true)
++	}
++	if nativeContract.HasHostedWebSearch {
++		c.Set("openai_responses_has_web_search", true)
++	}
++	if nativeContract.RequestsWebSearchSources {
++		c.Set("openai_responses_include_web_search_sources", true)
++	}
++	reqLog = reqLog.With(
++		zap.String("model", reqModel),
++		zap.Bool("stream", reqStream),
++		zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
++		zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
++		zap.Bool("requires_native_responses", nativeContract.RequiresNativeResponses),
++		zap.Bool("background", nativeContract.Background),
++		zap.String("tool_choice", nativeContract.ToolChoice),
++	)
+ 	previousResponseID := strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
+ 	if previousResponseID != "" {
+ 		previousResponseIDKind := service.ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
+@@ -307,6 +356,15 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
+ 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
+ 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)
+ 	seedOpenAIForwardImageIntentHint(c, channelMapping.Mapped, imageIntent)
++	if channelMapping.Mapped {
++		reqLog = reqLog.With(
++			zap.Bool("model_mapping_applied", true),
++			zap.String("mapped_model", channelMapping.MappedModel),
++		)
++		c.Set("openai_mapped_model", channelMapping.MappedModel)
++	} else {
++		reqLog = reqLog.With(zap.Bool("model_mapping_applied", false))
++	}
+ 
+ 	// 提前校验 function_call_output 是否具备可关联上下文，避免上游 400。
+ 	if !h.validateFunctionCallOutputRequest(c, body, reqLog) {
+@@ -366,9 +424,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
+ 	// 使用 IsExplicitImageGenerationIntent 排除被动 image_gen namespace 声明，
+ 	// 避免 Codex 的被动工具目录使 CC-only 账号被误过滤（#4476）。
+ 	requiredCapability := service.OpenAIEndpointCapabilityChatCompletions
+-	if service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, body) && requestPlatform == service.PlatformOpenAI {
++	if requestPlatform == service.PlatformOpenAI &&
++		(nativeContract.RequiresNativeResponses || service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, body)) {
+ 		requiredCapability = service.OpenAIEndpointCapabilityResponses
+ 	}
++	reqLog.Debug("openai.responses_request_features",
++		zap.String("required_capability", string(requiredCapability)),
++	)
+ 
+ 	for {
+ 		// Streaming Forward intentionally detaches the upstream request so usage can
+@@ -856,7 +918,25 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
+ 	preferredMappedModel := resolveOpenAIMessagesDispatchMappedModel(apiKey, reqModel)
+ 	reqStream := gjson.GetBytes(body, "stream").Bool()
+ 
+-	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
++	nativeContract := service.OpenAIResponsesNativeContract(body)
++	if nativeContract.RequiresNativeResponses {
++		c.Set("openai_responses_requires_native", true)
++	}
++	if nativeContract.HasHostedWebSearch {
++		c.Set("openai_responses_has_web_search", true)
++	}
++	if nativeContract.RequestsWebSearchSources {
++		c.Set("openai_responses_include_web_search_sources", true)
++	}
++	reqLog = reqLog.With(
++		zap.String("model", reqModel),
++		zap.Bool("stream", reqStream),
++		zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
++		zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
++		zap.Bool("requires_native_responses", nativeContract.RequiresNativeResponses),
++		zap.Bool("background", nativeContract.Background),
++		zap.String("tool_choice", nativeContract.ToolChoice),
++	)
+ 
+ 	setOpsRequestContext(c, reqModel, reqStream)
+ 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
+@@ -1317,6 +1397,7 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
+ 			zap.Int64("account_id", account.ID),
+ 			zap.Int("max_waiting", selection.WaitPlan.MaxWaiting),
+ 		)
++		markOpenAIRateLimitLayer(c, "proxy_queue", http.StatusTooManyRequests, "")
+ 		h.handleStreamingAwareError(c, http.StatusTooManyRequests, "rate_limit_error", "Too many pending requests, please retry later", *streamStarted)
+ 		return nil, false
+ 	}
+@@ -1330,6 +1411,7 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
+ 	}
+ 	defer releaseWait()
+ 
++	queueWaitStart := time.Now()
+ 	accountReleaseFunc, err := h.concurrencyHelper.AcquireAccountSlotWithWaitTimeout(
+ 		c,
+ 		account.ID,
+@@ -1339,10 +1421,19 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
+ 		streamStarted,
+ 	)
+ 	if err != nil {
+-		reqLog.Warn("openai.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
++		reqLog.Warn("openai.account_slot_acquire_failed",
++			zap.Int64("account_id", account.ID),
++			zap.Int64("queue_wait_ms", time.Since(queueWaitStart).Milliseconds()),
++			zap.Error(err),
++		)
+ 		h.handleConcurrencyError(c, err, "account", *streamStarted)
+ 		return nil, false
+ 	}
++	reqLog.Debug("openai.account_slot_acquired_after_wait",
++		zap.Int64("account_id", account.ID),
++		zap.Int64("queue_wait_ms", time.Since(queueWaitStart).Milliseconds()),
++		zap.Int("max_concurrency", selection.WaitPlan.MaxConcurrency),
++	)
+ 
+ 	// Slot acquired: no longer waiting in queue.
+ 	releaseWait()
+@@ -2109,6 +2200,9 @@ func (h *OpenAIGatewayHandler) acquireImageGenerationSlot(c *gin.Context, stream
+ // handleConcurrencyError handles concurrency-related acquire errors.
+ func (h *OpenAIGatewayHandler) handleConcurrencyError(c *gin.Context, err error, slotType string, streamStarted bool) {
+ 	status, errType, message := concurrencyErrorResponse(err, slotType)
++	if status == http.StatusTooManyRequests {
++		markOpenAIRateLimitLayer(c, "proxy_concurrency", status, "")
++	}
+ 	h.handleStreamingAwareError(c, status, errType, message, streamStarted)
+ }
+ 
+@@ -2129,6 +2223,9 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
+ 		return
+ 	}
+ 	copyFailoverRetryAfter(c, failoverErr.ResponseHeaders)
++	if failoverErr.StatusCode == http.StatusTooManyRequests {
++		markOpenAIRateLimitLayer(c, "upstream", failoverErr.StatusCode, failoverErr.ResponseHeaders.Get("x-request-id"))
++	}
+ 	if failoverErr.IsCredentialFailure() {
+ 		status, message := credentialFailoverClientResponse(failoverErr)
+ 		h.handleStreamingAwareError(c, status, "upstream_error", message, streamStarted)
+@@ -2214,6 +2311,9 @@ func isSafeRetryAfter(value string) bool {
+ func (h *OpenAIGatewayHandler) handleFailoverExhaustedSimple(c *gin.Context, statusCode int, streamStarted bool) {
+ 	status, errType, errMsg := h.mapUpstreamError(statusCode)
+ 	service.SetOpsUpstreamError(c, statusCode, errMsg, "")
++	if statusCode == http.StatusTooManyRequests {
++		markOpenAIRateLimitLayer(c, "upstream", statusCode, "")
++	}
+ 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
+ }
+ 
+@@ -2431,12 +2531,33 @@ func (h *OpenAIGatewayHandler) errorResponse(c *gin.Context, status int, errType
+ 			return
+ 		}
+ 	}
+-	c.JSON(status, gin.H{
+-		"error": gin.H{
+-			"type":    errType,
+-			"message": message,
+-		},
+-	})
++	errObj := gin.H{
++		"type":    errType,
++		"message": message,
++	}
++	if c != nil && c.Request != nil {
++		if requestID, _ := c.Request.Context().Value(ctxkey.ClientRequestID).(string); strings.TrimSpace(requestID) != "" {
++			errObj["request_id"] = strings.TrimSpace(requestID)
++		}
++	}
++	if c != nil {
++		if layer, ok := c.Get(openAIRateLimitLayerContextKey); ok {
++			if v, ok := layer.(string); ok && strings.TrimSpace(v) != "" {
++				errObj["rate_limit_layer"] = strings.TrimSpace(v)
++			}
++		}
++		if upstreamStatus, ok := c.Get(openAIRateLimitUpstreamStatusKey); ok {
++			if v, ok := upstreamStatus.(string); ok && strings.TrimSpace(v) != "" {
++				errObj["upstream_status_code"] = strings.TrimSpace(v)
++			}
++		}
++		if upstreamRID, ok := c.Get(openAIRateLimitUpstreamRequestIDKey); ok {
++			if v, ok := upstreamRID.(string); ok && strings.TrimSpace(v) != "" {
++				errObj["upstream_request_id"] = strings.TrimSpace(v)
++			}
++		}
++	}
++	c.JSON(status, gin.H{"error": errObj})
+ }
+ 
+ // openAICompactKeepaliveInterval 复用流式 keepalive 配置作为 compact 下游
 diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
-index 54d82a69e..45c75ae5e 100644
+index 54d82a6..45c75ae 100644
 --- a/backend/internal/handler/wire.go
 +++ b/backend/internal/handler/wire.go
 @@ -181,29 +181,31 @@ func ProvideHandlers(
@@ -1021,7 +1257,7 @@ index 54d82a69e..45c75ae5e 100644
  	// Admin handlers
 diff --git a/backend/internal/repository/background_response_task_store.go b/backend/internal/repository/background_response_task_store.go
 new file mode 100644
-index 000000000..5ae0e2e46
+index 0000000..5ae0e2e
 --- /dev/null
 +++ b/backend/internal/repository/background_response_task_store.go
 @@ -0,0 +1,48 @@
@@ -1075,7 +1311,7 @@ index 000000000..5ae0e2e46
 +}
 diff --git a/backend/internal/repository/background_response_task_store_test.go b/backend/internal/repository/background_response_task_store_test.go
 new file mode 100644
-index 000000000..d21a376ed
+index 0000000..d21a376
 --- /dev/null
 +++ b/backend/internal/repository/background_response_task_store_test.go
 @@ -0,0 +1,44 @@
@@ -1124,7 +1360,7 @@ index 000000000..d21a376ed
 +	require.ErrorIs(t, err, service.ErrBackgroundResponseNotFound)
 +}
 diff --git a/backend/internal/repository/wire.go b/backend/internal/repository/wire.go
-index 0bfd2d005..ceae07ce9 100644
+index 0bfd2d0..ceae07c 100644
 --- a/backend/internal/repository/wire.go
 +++ b/backend/internal/repository/wire.go
 @@ -121,6 +121,7 @@ var ProviderSet = wire.NewSet(
@@ -1136,7 +1372,7 @@ index 0bfd2d005..ceae07ce9 100644
  	NewBatchImageDownloadLimiter,
  	NewLeaderLockCache,
 diff --git a/backend/internal/server/middleware/api_key_auth.go b/backend/internal/server/middleware/api_key_auth.go
-index bcec39760..345b7bdf3 100644
+index bcec397..345b7bd 100644
 --- a/backend/internal/server/middleware/api_key_auth.go
 +++ b/backend/internal/server/middleware/api_key_auth.go
 @@ -28,7 +28,7 @@ func NewAPIKeyAuthMiddleware(apiKeyService *service.APIKeyService, subscriptionS
@@ -1177,7 +1413,7 @@ index bcec39760..345b7bdf3 100644
  func GetAPIKeyFromContext(c *gin.Context) (*service.APIKey, bool) {
  	value, exists := c.Get(string(ContextKeyAPIKey))
 diff --git a/backend/internal/server/middleware/api_key_auth_image_task_test.go b/backend/internal/server/middleware/api_key_auth_image_task_test.go
-index 653fd8ba3..aa0bfd763 100644
+index 653fd8b..aa0bfd7 100644
 --- a/backend/internal/server/middleware/api_key_auth_image_task_test.go
 +++ b/backend/internal/server/middleware/api_key_auth_image_task_test.go
 @@ -13,3 +13,12 @@ func TestIsAsyncImageTaskRead(t *testing.T) {
@@ -1194,7 +1430,7 @@ index 653fd8ba3..aa0bfd763 100644
 +	require.False(t, isBackgroundResponseRead(http.MethodGet, "/v1/responses-archive/resp_bg_123"))
 +}
 diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
-index 07b8f1ebd..5fe79d8e1 100644
+index 07b8f1e..5fe79d8 100644
 --- a/backend/internal/server/routes/gateway.go
 +++ b/backend/internal/server/routes/gateway.go
 @@ -167,6 +167,9 @@ func RegisterGatewayRoutes(
@@ -1249,7 +1485,7 @@ index 07b8f1ebd..5fe79d8e1 100644
  		h.OpenAIGateway.ResponsesWebSocket(c)
 diff --git a/backend/internal/service/background_response_task.go b/backend/internal/service/background_response_task.go
 new file mode 100644
-index 000000000..c6cce6d4b
+index 0000000..c6cce6d
 --- /dev/null
 +++ b/backend/internal/service/background_response_task.go
 @@ -0,0 +1,185 @@
@@ -1440,7 +1676,7 @@ index 000000000..c6cce6d4b
 +}
 diff --git a/backend/internal/service/background_response_task_test.go b/backend/internal/service/background_response_task_test.go
 new file mode 100644
-index 000000000..174210375
+index 0000000..1742103
 --- /dev/null
 +++ b/backend/internal/service/background_response_task_test.go
 @@ -0,0 +1,99 @@
@@ -1543,8 +1779,526 @@ index 000000000..174210375
 +	_, err := svc.Create(context.Background(), BackgroundResponseOwner{UserID: 1, APIKeyID: 2}, "gpt-5")
 +	require.ErrorIs(t, err, ErrBackgroundResponseUnavailable)
 +}
+diff --git a/backend/internal/service/openai_gateway_forward.go b/backend/internal/service/openai_gateway_forward.go
+index 93697be..b32ed41 100644
+--- a/backend/internal/service/openai_gateway_forward.go
++++ b/backend/internal/service/openai_gateway_forward.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/tidwall/gjson"
++	"go.uber.org/zap"
+ )
+ 
+ // Forward forwards request to OpenAI API
+@@ -76,12 +77,31 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 	requestView := newOpenAIRequestView(body)
+ 	reqModel, reqStream, promptCacheKey := requestView.Model, requestView.Stream, requestView.PromptCacheKey
+ 	originalModel := reqModel
++	nativeContract := OpenAIResponsesNativeContract(body)
+ 
+ 	if account.Platform == PlatformGrok {
+ 		return s.forwardGrokResponses(ctx, c, account, body, originalModel, reqStream, startTime)
+ 	}
+ 
+ 	if account.Type == AccountTypeAPIKey && !openai_compat.ShouldUseResponsesAPI(account.Extra) {
++		if nativeContract.RequiresNativeResponses {
++			if c != nil {
++				c.Set("openai_responses_requires_native", true)
++				c.Set("openai_responses_has_web_search", nativeContract.HasHostedWebSearch)
++				c.Set("openai_responses_include_web_search_sources", nativeContract.RequestsWebSearchSources)
++			}
++			logger.L().Warn("openai responses: refusing chat completions fallback for native-only request",
++				zap.Int64("account_id", account.ID),
++				zap.String("account_name", account.Name),
++				zap.String("original_model", originalModel),
++				zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
++				zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
++				zap.Bool("background", nativeContract.Background),
++				zap.String("tool_choice", nativeContract.ToolChoice),
++			)
++			writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "upstream_configuration_error", "Selected upstream only supports Chat Completions fallback and cannot preserve native Responses hosted tool output")
++			return nil, errors.New("responses request requires native /v1/responses upstream")
++		}
+ 		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body)
+ 	}
+ 
+diff --git a/backend/internal/service/openai_gateway_response_handling.go b/backend/internal/service/openai_gateway_response_handling.go
+index 8857bdd..840b597 100644
+--- a/backend/internal/service/openai_gateway_response_handling.go
++++ b/backend/internal/service/openai_gateway_response_handling.go
+@@ -1448,18 +1448,22 @@ func responsesStreamEventMayContributeToOutput(eventType string) bool {
+ 	}
+ }
+ 
+-// collectRawResponsesOutputItemsFromSSE 按到达顺序收集 SSE 流中
+-// response.output_item.done 携带的原始 item。除已产生结果但仍停留在进行中
+-// 的图片状态外，item 以 raw JSON 逐字节保留，
+-// 避免经窄结构体重建时丢弃 encrypted_content/summary/opaque 等 compact
+-// 专属或未来新增字段（#3777 问题 2）。若整条流没有任何 done 事件，退回
+-// 收集 output_item.added 中的 compaction 类 item——compaction 结果没有
+-// delta 事件，部分上游只在 added 事件中携带完整 item。
++// collectRawResponsesOutputItemsFromSSE 按到达顺序收集 SSE 流中的原始 output
++// item。response.output_item.done 是权威终态；对没有 delta 的 hosted tool
++// item（例如 web_search_call.action.sources、compaction）允许用
++// response.output_item.added 兜底。item 以 raw JSON 逐字节保留，避免经窄
++// 结构体重建时丢弃 action.sources、encrypted_content、summary 或未来新增字段。
+ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
+-	var items []json.RawMessage
+-	seen := make(map[string]struct{})
+-	hasCompactionItem := false
+-	appendItem := func(item gjson.Result) {
++	type rawOutputItemCandidate struct {
++		raw      json.RawMessage
++		fromDone bool
++	}
++	itemsByKey := make(map[string]rawOutputItemCandidate)
++	order := make([]string, 0, 4)
++	deferredAddedOrder := make([]string, 0, 1)
++	deferredAddedSeen := make(map[string]struct{})
++	hasDoneCompaction := false
++	appendOrReplace := func(item gjson.Result, fromDone bool, deferAddedOrder bool) {
+ 		if !item.Exists() || !item.IsObject() {
+ 			return
+ 		}
+@@ -1467,38 +1471,71 @@ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
+ 		if key == "" {
+ 			key = item.Raw
+ 		}
+-		if _, dup := seen[key]; dup {
++		existing, exists := itemsByKey[key]
++		if exists && existing.fromDone {
+ 			return
+ 		}
+-		seen[key] = struct{}{}
+-		if isResponsesCompactionItemType(item.Get("type").String()) {
+-			hasCompactionItem = true
++		if !fromDone && exists {
++			return
++		}
++		if !exists && !deferAddedOrder {
++			order = append(order, key)
+ 		}
+-		items = append(items, json.RawMessage(item.Raw))
++		if !exists && deferAddedOrder {
++			if _, seenDeferred := deferredAddedSeen[key]; !seenDeferred {
++				deferredAddedSeen[key] = struct{}{}
++				deferredAddedOrder = append(deferredAddedOrder, key)
++			}
++		}
++		itemsByKey[key] = rawOutputItemCandidate{raw: json.RawMessage(item.Raw), fromDone: fromDone}
+ 	}
+ 	forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
+ 		if normalized, changed := normalizeCompletedImageGenerationStatus(data); changed {
+ 			data = normalized
+ 		}
+-		if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.done" {
+-			return
++		eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
++		item := gjson.GetBytes(data, "item")
++		switch eventType {
++		case "response.output_item.done":
++			if isResponsesCompactionItemType(item.Get("type").String()) {
++				hasDoneCompaction = true
++			}
++			appendOrReplace(item, true, false)
++		case "response.output_item.added":
++			// message/function_call/reasoning items are assembled from deltas or
++			// later done events; taking their early added form would create empty
++			// or partial output. Hosted tool calls are atomic in added/done events
++			// and must be kept even when a terminal response has output:[].
++			if responsesOutputItemCanUseAddedFallback(item.Get("type").String()) {
++				appendOrReplace(item, false, isResponsesCompactionItemType(item.Get("type").String()))
++			}
+ 		}
+-		appendItem(gjson.GetBytes(data, "item"))
+ 	})
+-	// done 事件未携带 compaction item 时再看 added：覆盖"其他 item 有 done、
+-	// compaction 只在 added 中"的混合形态；done 已含 compaction 时跳过，
+-	// 避免同一 item 在无 id 可去重时被收集两份（Codex 要求恰好一个）。
+-	if !hasCompactionItem {
+-		forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
+-			if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.added" {
+-				return
++	if len(deferredAddedOrder) > 0 {
++		seenOrder := make(map[string]struct{}, len(order))
++		for _, key := range order {
++			seenOrder[key] = struct{}{}
++		}
++		for _, key := range deferredAddedOrder {
++			if _, seen := seenOrder[key]; seen {
++				continue
+ 			}
+-			item := gjson.GetBytes(data, "item")
+-			if !isResponsesCompactionItemType(item.Get("type").String()) {
+-				return
++			if hasDoneCompaction {
++				if candidate, ok := itemsByKey[key]; ok && isResponsesCompactionItemType(gjson.GetBytes(candidate.raw, "type").String()) {
++					continue
++				}
+ 			}
+-			appendItem(item)
+-		})
++			order = append(order, key)
++		}
++	}
++	if len(order) == 0 {
++		return nil, false
++	}
++	items := make([]json.RawMessage, 0, len(order))
++	for _, key := range order {
++		if candidate, ok := itemsByKey[key]; ok && len(candidate.raw) > 0 {
++			items = append(items, candidate.raw)
++		}
+ 	}
+ 	if len(items) == 0 {
+ 		return nil, false
+@@ -1510,6 +1547,26 @@ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
+ 	return outputJSON, true
+ }
+ 
++func responsesOutputItemCanUseAddedFallback(itemType string) bool {
++	switch strings.TrimSpace(itemType) {
++	case "web_search_call",
++		"file_search_call",
++		"image_generation_call",
++		"code_interpreter_call",
++		"computer_call",
++		"mcp_call",
++		"mcp_approval_request",
++		"mcp_list_tools",
++		"local_shell_call",
++		"custom_tool_call",
++		"compaction",
++		"compaction_summary":
++		return true
++	default:
++		return false
++	}
++}
++
+ // isResponsesCompactionItemType reports whether the item type is the Codex
+ // remote-compact result item ("compaction", upstream alias "compaction_summary").
+ func isResponsesCompactionItemType(itemType string) bool {
+diff --git a/backend/internal/service/openai_gateway_responses_chat_fallback.go b/backend/internal/service/openai_gateway_responses_chat_fallback.go
+index 1082b02..027d2ac 100644
+--- a/backend/internal/service/openai_gateway_responses_chat_fallback.go
++++ b/backend/internal/service/openai_gateway_responses_chat_fallback.go
+@@ -25,6 +25,11 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
+ 	body []byte,
+ ) (*OpenAIForwardResult, error) {
+ 	startTime := time.Now()
++	if OpenAIResponsesRequestRequiresNativeResponses(body) {
++		msg := "Responses request requires native /v1/responses hosted tool output; Chat Completions fallback cannot preserve web_search_call.action.sources"
++		writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "upstream_configuration_error", msg)
++		return nil, errors.New("responses request requires native /v1/responses upstream")
++	}
+ 
+ 	var responsesReq apicompat.ResponsesRequest
+ 	if err := json.Unmarshal(body, &responsesReq); err != nil {
+diff --git a/backend/internal/service/openai_responses_native_contract.go b/backend/internal/service/openai_responses_native_contract.go
+new file mode 100644
+index 0000000..85f5be0
+--- /dev/null
++++ b/backend/internal/service/openai_responses_native_contract.go
+@@ -0,0 +1,117 @@
++package service
++
++import (
++	"strings"
++
++	"github.com/tidwall/gjson"
++)
++
++// OpenAIResponsesNativeContractSummary is a redacted, prompt-free summary of
++// Responses API features that cannot be faithfully represented through the
++// Chat Completions fallback bridge.
++type OpenAIResponsesNativeContractSummary struct {
++	HasHostedWebSearch       bool
++	RequestsWebSearchSources bool
++	Background               bool
++	ToolChoice               string
++	RequiresNativeResponses  bool
++}
++
++// OpenAIResponsesNativeContract returns a small diagnostic summary for routing
++// and logging. It deliberately inspects only structural fields (tools,
++// tool_choice, include, background) and never logs or stores user prompt text.
++func OpenAIResponsesNativeContract(body []byte) OpenAIResponsesNativeContractSummary {
++	summary := OpenAIResponsesNativeContractSummary{
++		HasHostedWebSearch:       openAIResponsesRequestHasHostedWebSearch(body),
++		RequestsWebSearchSources: openAIResponsesRequestRequestsWebSearchSources(body),
++		Background:               gjson.GetBytes(body, "background").Bool(),
++		ToolChoice:               openAIResponsesToolChoiceSummary(body),
++	}
++	summary.RequiresNativeResponses = summary.HasHostedWebSearch || summary.RequestsWebSearchSources || summary.Background
++	return summary
++}
++
++// OpenAIResponsesRequestRequiresNativeResponses reports whether the request
++// must be forwarded to an upstream /v1/responses implementation. Returning true
++// means the raw Chat Completions fallback would lose official Responses
++// semantics (for example hosted web_search_call.action.sources) and must not be
++// used as a silent degradation path.
++func OpenAIResponsesRequestRequiresNativeResponses(body []byte) bool {
++	return OpenAIResponsesNativeContract(body).RequiresNativeResponses
++}
++
++func openAIResponsesRequestHasHostedWebSearch(body []byte) bool {
++	tools := gjson.GetBytes(body, "tools")
++	if tools.IsArray() {
++		for _, tool := range tools.Array() {
++			if isOpenAIHostedWebSearchTool(tool) {
++				return true
++			}
++		}
++	}
++	toolChoice := gjson.GetBytes(body, "tool_choice")
++	return isOpenAIHostedWebSearchTool(toolChoice) ||
++		isOpenAIHostedWebSearchName(toolChoice.String()) ||
++		isOpenAIHostedWebSearchName(toolChoice.Get("type").String()) ||
++		isOpenAIHostedWebSearchName(toolChoice.Get("name").String())
++}
++
++func openAIResponsesRequestRequestsWebSearchSources(body []byte) bool {
++	include := gjson.GetBytes(body, "include")
++	if !include.IsArray() {
++		return false
++	}
++	for _, entry := range include.Array() {
++		v := strings.TrimSpace(entry.String())
++		if v == "web_search_call.action.sources" ||
++			v == "web_search_call.results" ||
++			strings.HasPrefix(v, "web_search_call.") {
++			return true
++		}
++	}
++	return false
++}
++
++func isOpenAIHostedWebSearchTool(tool gjson.Result) bool {
++	if !tool.Exists() {
++		return false
++	}
++	if isOpenAIHostedWebSearchName(tool.Get("type").String()) {
++		return true
++	}
++	return isOpenAIHostedWebSearchName(tool.Get("name").String())
++}
++
++func isOpenAIHostedWebSearchName(value string) bool {
++	value = strings.TrimSpace(strings.ToLower(value))
++	return value == "web_search" ||
++		value == "web_search_preview" ||
++		strings.HasPrefix(value, "web_search_") ||
++		strings.HasPrefix(value, "web_search-preview")
++}
++
++func openAIResponsesToolChoiceSummary(body []byte) string {
++	toolChoice := gjson.GetBytes(body, "tool_choice")
++	if !toolChoice.Exists() {
++		return ""
++	}
++	if toolChoice.Type == gjson.String {
++		return strings.TrimSpace(toolChoice.String())
++	}
++	if toolChoice.IsObject() {
++		toolType := strings.TrimSpace(toolChoice.Get("type").String())
++		name := strings.TrimSpace(toolChoice.Get("name").String())
++		if name == "" {
++			name = strings.TrimSpace(toolChoice.Get("tool.name").String())
++		}
++		switch {
++		case toolType != "" && name != "":
++			return toolType + ":" + name
++		case toolType != "":
++			return toolType
++		case name != "":
++			return name
++		}
++	}
++	return "non_string"
++}
+diff --git a/backend/internal/service/openai_responses_web_search_test.go b/backend/internal/service/openai_responses_web_search_test.go
+new file mode 100644
+index 0000000..5b80fc5
+--- /dev/null
++++ b/backend/internal/service/openai_responses_web_search_test.go
+@@ -0,0 +1,172 @@
++//go:build unit
++
++package service
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/require"
++	"github.com/tidwall/gjson"
++)
++
++func TestOpenAIResponsesNativeContractDetectsWebSearchSources(t *testing.T) {
++	body := []byte(`{
++		"model":"gpt-5.6-sol",
++		"reasoning":{"effort":"high"},
++		"tools":[{"type":"web_search","search_context_size":"high"}],
++		"tool_choice":"required",
++		"include":["web_search_call.action.sources"],
++		"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}},
++		"input":"latest OpenAI web search docs"
++	}`)
++
++	summary := OpenAIResponsesNativeContract(body)
++	require.True(t, summary.HasHostedWebSearch)
++	require.True(t, summary.RequestsWebSearchSources)
++	require.True(t, summary.RequiresNativeResponses)
++	require.Equal(t, "required", summary.ToolChoice)
++}
++
++func TestForwardResponses_WebSearchUsesNativeResponsesAndPreservesRequest(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++
++	body := []byte(`{
++		"model":"gpt-5.6-sol",
++		"stream":false,
++		"store":false,
++		"reasoning":{"effort":"high"},
++		"tools":[{"type":"web_search","search_context_size":"high"}],
++		"tool_choice":"required",
++		"include":["web_search_call.action.sources"],
++		"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}},
++		"max_output_tokens":8000,
++		"input":"Return strict JSON using a consulted source."
++	}`)
++	rec := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(rec)
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
++	c.Request.Header.Set("Content-Type", "application/json")
++
++	upstream := &httpUpstreamRecorder{resp: &http.Response{
++		StatusCode: http.StatusOK,
++		Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid_web_search_native"}},
++		Body: io.NopCloser(strings.NewReader(`{
++			"id":"resp_ws_1",
++			"object":"response",
++			"model":"gpt-5.6-sol",
++			"status":"completed",
++			"output":[
++				{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"OpenAI Web Search","sources":[{"type":"url","url":"https://developers.openai.com/api/docs/guides/tools-web-search","title":"Web search"}]}},
++				{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"{\"answer\":\"ok\"}"}]}
++			],
++			"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}
++		}`)),
++	}}
++	svc := &OpenAIGatewayService{
++		cfg:          rawChatCompletionsTestConfig(),
++		httpUpstream: upstream,
++	}
++	account := rawChatCompletionsTestAccount()
++	account.Extra = map[string]any{
++		openai_compat.ExtraKeyResponsesMode:      string(openai_compat.ResponsesSupportModeAuto),
++		openai_compat.ExtraKeyResponsesSupported: true,
++	}
++
++	result, err := svc.Forward(context.Background(), c, account, body)
++	require.NoError(t, err)
++	require.NotNil(t, result)
++	require.Equal(t, "http://upstream.example/v1/responses", upstream.lastReq.URL.String())
++	require.Equal(t, "web_search", gjson.GetBytes(upstream.lastBody, "tools.0.type").String())
++	require.Equal(t, "high", gjson.GetBytes(upstream.lastBody, "tools.0.search_context_size").String())
++	require.Equal(t, "required", gjson.GetBytes(upstream.lastBody, "tool_choice").String())
++	require.Equal(t, "web_search_call.action.sources", gjson.GetBytes(upstream.lastBody, "include.0").String())
++	require.Equal(t, "high", gjson.GetBytes(upstream.lastBody, "reasoning.effort").String())
++	require.True(t, gjson.GetBytes(upstream.lastBody, "text.format.strict").Bool())
++	require.Equal(t, int64(8000), gjson.GetBytes(upstream.lastBody, "max_output_tokens").Int())
++	require.Equal(t, "web_search_call", gjson.Get(rec.Body.String(), "output.0.type").String())
++	require.Equal(t, "https://developers.openai.com/api/docs/guides/tools-web-search", gjson.Get(rec.Body.String(), "output.0.action.sources.0.url").String())
++	require.Equal(t, 10, result.Usage.InputTokens)
++	require.Equal(t, 5, result.Usage.OutputTokens)
++}
++
++func TestForwardResponses_ChatFallbackRejectsWebSearchSourcesInsteadOfFaking(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++
++	body := []byte(`{"model":"gpt-5.6-sol","tools":[{"type":"web_search","search_context_size":"high"}],"tool_choice":"required","include":["web_search_call.action.sources"],"input":"search"}`)
++	rec := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(rec)
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
++	c.Request.Header.Set("Content-Type", "application/json")
++
++	upstream := &httpUpstreamRecorder{}
++	svc := &OpenAIGatewayService{
++		cfg:          rawChatCompletionsTestConfig(),
++		httpUpstream: upstream,
++	}
++
++	result, err := svc.Forward(context.Background(), c, forceChatResponsesFallbackAccount(), body)
++	require.Error(t, err)
++	require.Nil(t, result)
++	require.Nil(t, upstream.lastReq)
++	require.Equal(t, http.StatusBadGateway, rec.Code)
++	require.Equal(t, "upstream_configuration_error", gjson.Get(rec.Body.String(), "error.type").String())
++}
++
++func TestReconstructResponseOutputFromSSEPreservesWebSearchCallSourcesFromAdded(t *testing.T) {
++	bodyText := strings.Join([]string{
++		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"OpenAI","sources":[{"type":"url","url":"https://developers.openai.com/api/docs/guides/tools-web-search","title":"Web search"}]}}}`,
++		"",
++		`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"{\"answer\":\"ok\"}"}]}}`,
++		"",
++		`data: {"type":"response.completed","response":{"id":"resp_ws_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7}}}`,
++		"",
++		"data: [DONE]",
++		"",
++	}, "\n")
++
++	outputJSON, ok := reconstructResponseOutputFromSSE(bodyText)
++	require.True(t, ok)
++	require.Equal(t, "web_search_call", gjson.GetBytes(outputJSON, "0.type").String())
++	require.Equal(t, "https://developers.openai.com/api/docs/guides/tools-web-search", gjson.GetBytes(outputJSON, "0.action.sources.0.url").String())
++	require.Equal(t, "message", gjson.GetBytes(outputJSON, "1.type").String())
++}
++
++func TestHandleSSEToJSONPreservesWebSearchCallSources(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	bodyText := strings.Join([]string{
++		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"OpenAI","sources":[{"type":"url","url":"https://developers.openai.com/api/docs/guides/tools-web-search","title":"Web search"}]}}}`,
++		"",
++		`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"{\"answer\":\"ok\"}"}]}}`,
++		"",
++		`data: {"type":"response.completed","response":{"id":"resp_ws_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7}}}`,
++		"",
++		"data: [DONE]",
++		"",
++	}, "\n")
++	rec := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(rec)
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++	resp := &http.Response{
++		StatusCode: http.StatusOK,
++		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_sse_ws"}},
++	}
++	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig()}
++
++	result, err := svc.handleSSEToJSON(resp, c, []byte(bodyText), "gpt-5.6-sol", "gpt-5.6-sol")
++	require.NoError(t, err)
++	require.NotNil(t, result)
++	require.Equal(t, http.StatusOK, rec.Code)
++	require.Equal(t, "web_search_call", gjson.Get(rec.Body.String(), "output.0.type").String())
++	require.Equal(t, "https://developers.openai.com/api/docs/guides/tools-web-search", gjson.Get(rec.Body.String(), "output.0.action.sources.0.url").String())
++	require.NotNil(t, result.usage)
++	require.Equal(t, 4, result.usage.InputTokens)
++	require.Equal(t, 3, result.usage.OutputTokens)
++}
 diff --git a/backend/internal/service/update_service.go b/backend/internal/service/update_service.go
-index 82df3bb02..a6b885759 100644
+index 82df3bb..a6b8857 100644
 --- a/backend/internal/service/update_service.go
 +++ b/backend/internal/service/update_service.go
 @@ -25,12 +25,17 @@ import (
@@ -1654,7 +2408,7 @@ index 82df3bb02..a6b885759 100644
  	}
  	return result
 diff --git a/backend/internal/service/update_service_test.go b/backend/internal/service/update_service_test.go
-index 243e25d1e..490b97092 100644
+index 243e25d..490b970 100644
 --- a/backend/internal/service/update_service_test.go
 +++ b/backend/internal/service/update_service_test.go
 @@ -69,6 +69,40 @@ func TestUpdateServicePerformUpdateNoUpdateReturnsSentinel(t *testing.T) {
@@ -1699,7 +2453,7 @@ index 243e25d1e..490b97092 100644
  	return NewUpdateService(
  		&updateServiceCacheStub{},
 diff --git a/backend/internal/service/wire.go b/backend/internal/service/wire.go
-index f3ee81539..335aad077 100644
+index f3ee815..335aad0 100644
 --- a/backend/internal/service/wire.go
 +++ b/backend/internal/service/wire.go
 @@ -681,6 +681,7 @@ var ProviderSet = wire.NewSet(
@@ -1711,7 +2465,7 @@ index f3ee81539..335aad077 100644
  	NewBatchImagePublicService,
  	NewBatchImageDownloadService,
 diff --git a/frontend/src/api/admin/system.ts b/frontend/src/api/admin/system.ts
-index eb3db9b06..2ecc1b7ac 100644
+index eb3db9b..2ecc1b7 100644
 --- a/frontend/src/api/admin/system.ts
 +++ b/frontend/src/api/admin/system.ts
 @@ -43,6 +43,7 @@ export async function checkUpdates(force = false): Promise<VersionInfo> {
@@ -1723,7 +2477,7 @@ index eb3db9b06..2ecc1b7ac 100644
  
  export interface RollbackVersionInfo {
 diff --git a/frontend/src/components/common/VersionBadge.vue b/frontend/src/components/common/VersionBadge.vue
-index 7fd62947f..5b4ffd097 100644
+index 7fd6294..5b4ffd0 100644
 --- a/frontend/src/components/common/VersionBadge.vue
 +++ b/frontend/src/components/common/VersionBadge.vue
 @@ -765,6 +765,9 @@ async function handleUpdate() {

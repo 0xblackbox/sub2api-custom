@@ -1448,18 +1448,22 @@ func responsesStreamEventMayContributeToOutput(eventType string) bool {
 	}
 }
 
-// collectRawResponsesOutputItemsFromSSE 按到达顺序收集 SSE 流中
-// response.output_item.done 携带的原始 item。除已产生结果但仍停留在进行中
-// 的图片状态外，item 以 raw JSON 逐字节保留，
-// 避免经窄结构体重建时丢弃 encrypted_content/summary/opaque 等 compact
-// 专属或未来新增字段（#3777 问题 2）。若整条流没有任何 done 事件，退回
-// 收集 output_item.added 中的 compaction 类 item——compaction 结果没有
-// delta 事件，部分上游只在 added 事件中携带完整 item。
+// collectRawResponsesOutputItemsFromSSE 按到达顺序收集 SSE 流中的原始 output
+// item。response.output_item.done 是权威终态；对没有 delta 的 hosted tool
+// item（例如 web_search_call.action.sources、compaction）允许用
+// response.output_item.added 兜底。item 以 raw JSON 逐字节保留，避免经窄
+// 结构体重建时丢弃 action.sources、encrypted_content、summary 或未来新增字段。
 func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
-	var items []json.RawMessage
-	seen := make(map[string]struct{})
-	hasCompactionItem := false
-	appendItem := func(item gjson.Result) {
+	type rawOutputItemCandidate struct {
+		raw      json.RawMessage
+		fromDone bool
+	}
+	itemsByKey := make(map[string]rawOutputItemCandidate)
+	order := make([]string, 0, 4)
+	deferredAddedOrder := make([]string, 0, 1)
+	deferredAddedSeen := make(map[string]struct{})
+	hasDoneCompaction := false
+	appendOrReplace := func(item gjson.Result, fromDone bool, deferAddedOrder bool) {
 		if !item.Exists() || !item.IsObject() {
 			return
 		}
@@ -1467,38 +1471,71 @@ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
 		if key == "" {
 			key = item.Raw
 		}
-		if _, dup := seen[key]; dup {
+		existing, exists := itemsByKey[key]
+		if exists && existing.fromDone {
 			return
 		}
-		seen[key] = struct{}{}
-		if isResponsesCompactionItemType(item.Get("type").String()) {
-			hasCompactionItem = true
+		if !fromDone && exists {
+			return
 		}
-		items = append(items, json.RawMessage(item.Raw))
+		if !exists && !deferAddedOrder {
+			order = append(order, key)
+		}
+		if !exists && deferAddedOrder {
+			if _, seenDeferred := deferredAddedSeen[key]; !seenDeferred {
+				deferredAddedSeen[key] = struct{}{}
+				deferredAddedOrder = append(deferredAddedOrder, key)
+			}
+		}
+		itemsByKey[key] = rawOutputItemCandidate{raw: json.RawMessage(item.Raw), fromDone: fromDone}
 	}
 	forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
 		if normalized, changed := normalizeCompletedImageGenerationStatus(data); changed {
 			data = normalized
 		}
-		if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.done" {
-			return
+		eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
+		item := gjson.GetBytes(data, "item")
+		switch eventType {
+		case "response.output_item.done":
+			if isResponsesCompactionItemType(item.Get("type").String()) {
+				hasDoneCompaction = true
+			}
+			appendOrReplace(item, true, false)
+		case "response.output_item.added":
+			// message/function_call/reasoning items are assembled from deltas or
+			// later done events; taking their early added form would create empty
+			// or partial output. Hosted tool calls are atomic in added/done events
+			// and must be kept even when a terminal response has output:[].
+			if responsesOutputItemCanUseAddedFallback(item.Get("type").String()) {
+				appendOrReplace(item, false, isResponsesCompactionItemType(item.Get("type").String()))
+			}
 		}
-		appendItem(gjson.GetBytes(data, "item"))
 	})
-	// done 事件未携带 compaction item 时再看 added：覆盖"其他 item 有 done、
-	// compaction 只在 added 中"的混合形态；done 已含 compaction 时跳过，
-	// 避免同一 item 在无 id 可去重时被收集两份（Codex 要求恰好一个）。
-	if !hasCompactionItem {
-		forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
-			if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.added" {
-				return
+	if len(deferredAddedOrder) > 0 {
+		seenOrder := make(map[string]struct{}, len(order))
+		for _, key := range order {
+			seenOrder[key] = struct{}{}
+		}
+		for _, key := range deferredAddedOrder {
+			if _, seen := seenOrder[key]; seen {
+				continue
 			}
-			item := gjson.GetBytes(data, "item")
-			if !isResponsesCompactionItemType(item.Get("type").String()) {
-				return
+			if hasDoneCompaction {
+				if candidate, ok := itemsByKey[key]; ok && isResponsesCompactionItemType(gjson.GetBytes(candidate.raw, "type").String()) {
+					continue
+				}
 			}
-			appendItem(item)
-		})
+			order = append(order, key)
+		}
+	}
+	if len(order) == 0 {
+		return nil, false
+	}
+	items := make([]json.RawMessage, 0, len(order))
+	for _, key := range order {
+		if candidate, ok := itemsByKey[key]; ok && len(candidate.raw) > 0 {
+			items = append(items, candidate.raw)
+		}
 	}
 	if len(items) == 0 {
 		return nil, false
@@ -1508,6 +1545,26 @@ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
 		return nil, false
 	}
 	return outputJSON, true
+}
+
+func responsesOutputItemCanUseAddedFallback(itemType string) bool {
+	switch strings.TrimSpace(itemType) {
+	case "web_search_call",
+		"file_search_call",
+		"image_generation_call",
+		"code_interpreter_call",
+		"computer_call",
+		"mcp_call",
+		"mcp_approval_request",
+		"mcp_list_tools",
+		"local_shell_call",
+		"custom_tool_call",
+		"compaction",
+		"compaction_summary":
+		return true
+	default:
+		return false
+	}
 }
 
 // isResponsesCompactionItemType reports whether the item type is the Codex

@@ -25,6 +25,11 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	body []byte,
 ) (*OpenAIForwardResult, error) {
 	startTime := time.Now()
+	if OpenAIResponsesRequestRequiresNativeResponses(body) {
+		msg := "Responses request requires native /v1/responses hosted tool output; Chat Completions fallback cannot preserve web_search_call.action.sources"
+		writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "upstream_configuration_error", msg)
+		return nil, errors.New("responses request requires native /v1/responses upstream")
+	}
 
 	var responsesReq apicompat.ResponsesRequest
 	if err := json.Unmarshal(body, &responsesReq); err != nil {

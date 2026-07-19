@@ -42,7 +42,38 @@ type OpenAIGatewayHandler struct {
 	cfg                      *config.Config
 }
 
-const maxOpenAIFirstOutputTimeoutSwitches = 1
+const (
+	maxOpenAIFirstOutputTimeoutSwitches = 1
+
+	openAIRateLimitLayerContextKey      = "openai_rate_limit_layer"
+	openAIRateLimitUpstreamRequestIDKey = "openai_rate_limit_upstream_request_id"
+	openAIRateLimitUpstreamStatusKey    = "openai_rate_limit_upstream_status"
+	openAIRateLimitLayerHeader          = "X-RateLimit-Layer"
+	openAIUpstreamStatusCodeHeader      = "X-Upstream-Status-Code"
+	openAIUpstreamRequestIDHeader       = "X-Upstream-Request-ID"
+)
+
+func markOpenAIRateLimitLayer(c *gin.Context, layer string, upstreamStatus int, upstreamRequestID string) {
+	if c == nil {
+		return
+	}
+	layer = strings.TrimSpace(layer)
+	if layer == "" {
+		return
+	}
+	c.Set(openAIRateLimitLayerContextKey, layer)
+	c.Header(openAIRateLimitLayerHeader, layer)
+	if upstreamStatus > 0 {
+		status := strconv.Itoa(upstreamStatus)
+		c.Set(openAIRateLimitUpstreamStatusKey, status)
+		c.Header(openAIUpstreamStatusCodeHeader, status)
+	}
+	upstreamRequestID = strings.TrimSpace(upstreamRequestID)
+	if upstreamRequestID != "" && !strings.ContainsAny(upstreamRequestID, "\r\n") && len(upstreamRequestID) <= 128 {
+		c.Set(openAIRateLimitUpstreamRequestIDKey, upstreamRequestID)
+		c.Header(openAIUpstreamRequestIDHeader, upstreamRequestID)
+	}
+}
 
 func openAIForwardSucceededForScheduling(result *service.OpenAIForwardResult) bool {
 	return result.SucceededForScheduling()
@@ -247,7 +278,25 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
 		return
 	}
-	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
+	nativeContract := service.OpenAIResponsesNativeContract(body)
+	if nativeContract.RequiresNativeResponses {
+		c.Set("openai_responses_requires_native", true)
+	}
+	if nativeContract.HasHostedWebSearch {
+		c.Set("openai_responses_has_web_search", true)
+	}
+	if nativeContract.RequestsWebSearchSources {
+		c.Set("openai_responses_include_web_search_sources", true)
+	}
+	reqLog = reqLog.With(
+		zap.String("model", reqModel),
+		zap.Bool("stream", reqStream),
+		zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
+		zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
+		zap.Bool("requires_native_responses", nativeContract.RequiresNativeResponses),
+		zap.Bool("background", nativeContract.Background),
+		zap.String("tool_choice", nativeContract.ToolChoice),
+	)
 	previousResponseID := strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
 	if previousResponseID != "" {
 		previousResponseIDKind := service.ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
@@ -302,6 +351,15 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)
 	seedOpenAIForwardImageIntentHint(c, channelMapping.Mapped, imageIntent)
+	if channelMapping.Mapped {
+		reqLog = reqLog.With(
+			zap.Bool("model_mapping_applied", true),
+			zap.String("mapped_model", channelMapping.MappedModel),
+		)
+		c.Set("openai_mapped_model", channelMapping.MappedModel)
+	} else {
+		reqLog = reqLog.With(zap.Bool("model_mapping_applied", false))
+	}
 
 	// 提前校验 function_call_output 是否具备可关联上下文，避免上游 400。
 	if !h.validateFunctionCallOutputRequest(c, body, reqLog) {
@@ -361,9 +419,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// 使用 IsExplicitImageGenerationIntent 排除被动 image_gen namespace 声明，
 	// 避免 Codex 的被动工具目录使 CC-only 账号被误过滤（#4476）。
 	requiredCapability := service.OpenAIEndpointCapabilityChatCompletions
-	if service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, body) && requestPlatform == service.PlatformOpenAI {
+	if requestPlatform == service.PlatformOpenAI &&
+		(nativeContract.RequiresNativeResponses || service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, body)) {
 		requiredCapability = service.OpenAIEndpointCapabilityResponses
 	}
+	reqLog.Debug("openai.responses_request_features",
+		zap.String("required_capability", string(requiredCapability)),
+	)
 
 	for {
 		// Streaming Forward intentionally detaches the upstream request so usage can
@@ -1312,6 +1374,7 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
 			zap.Int64("account_id", account.ID),
 			zap.Int("max_waiting", selection.WaitPlan.MaxWaiting),
 		)
+		markOpenAIRateLimitLayer(c, "proxy_queue", http.StatusTooManyRequests, "")
 		h.handleStreamingAwareError(c, http.StatusTooManyRequests, "rate_limit_error", "Too many pending requests, please retry later", *streamStarted)
 		return nil, false
 	}
@@ -1325,6 +1388,7 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
 	}
 	defer releaseWait()
 
+	queueWaitStart := time.Now()
 	accountReleaseFunc, err := h.concurrencyHelper.AcquireAccountSlotWithWaitTimeout(
 		c,
 		account.ID,
@@ -1334,10 +1398,19 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
 		streamStarted,
 	)
 	if err != nil {
-		reqLog.Warn("openai.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+		reqLog.Warn("openai.account_slot_acquire_failed",
+			zap.Int64("account_id", account.ID),
+			zap.Int64("queue_wait_ms", time.Since(queueWaitStart).Milliseconds()),
+			zap.Error(err),
+		)
 		h.handleConcurrencyError(c, err, "account", *streamStarted)
 		return nil, false
 	}
+	reqLog.Debug("openai.account_slot_acquired_after_wait",
+		zap.Int64("account_id", account.ID),
+		zap.Int64("queue_wait_ms", time.Since(queueWaitStart).Milliseconds()),
+		zap.Int("max_concurrency", selection.WaitPlan.MaxConcurrency),
+	)
 
 	// Slot acquired: no longer waiting in queue.
 	releaseWait()
@@ -2104,6 +2177,9 @@ func (h *OpenAIGatewayHandler) acquireImageGenerationSlot(c *gin.Context, stream
 // handleConcurrencyError handles concurrency-related acquire errors.
 func (h *OpenAIGatewayHandler) handleConcurrencyError(c *gin.Context, err error, slotType string, streamStarted bool) {
 	status, errType, message := concurrencyErrorResponse(err, slotType)
+	if status == http.StatusTooManyRequests {
+		markOpenAIRateLimitLayer(c, "proxy_concurrency", status, "")
+	}
 	h.handleStreamingAwareError(c, status, errType, message, streamStarted)
 }
 
@@ -2124,6 +2200,9 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 		return
 	}
 	copyFailoverRetryAfter(c, failoverErr.ResponseHeaders)
+	if failoverErr.StatusCode == http.StatusTooManyRequests {
+		markOpenAIRateLimitLayer(c, "upstream", failoverErr.StatusCode, failoverErr.ResponseHeaders.Get("x-request-id"))
+	}
 	if failoverErr.IsCredentialFailure() {
 		status, message := credentialFailoverClientResponse(failoverErr)
 		h.handleStreamingAwareError(c, status, "upstream_error", message, streamStarted)
@@ -2209,6 +2288,9 @@ func isSafeRetryAfter(value string) bool {
 func (h *OpenAIGatewayHandler) handleFailoverExhaustedSimple(c *gin.Context, statusCode int, streamStarted bool) {
 	status, errType, errMsg := h.mapUpstreamError(statusCode)
 	service.SetOpsUpstreamError(c, statusCode, errMsg, "")
+	if statusCode == http.StatusTooManyRequests {
+		markOpenAIRateLimitLayer(c, "upstream", statusCode, "")
+	}
 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
 }
 
@@ -2382,12 +2464,33 @@ func (h *OpenAIGatewayHandler) errorResponse(c *gin.Context, status int, errType
 			return
 		}
 	}
-	c.JSON(status, gin.H{
-		"error": gin.H{
-			"type":    errType,
-			"message": message,
-		},
-	})
+	errObj := gin.H{
+		"type":    errType,
+		"message": message,
+	}
+	if c != nil && c.Request != nil {
+		if requestID, _ := c.Request.Context().Value(ctxkey.ClientRequestID).(string); strings.TrimSpace(requestID) != "" {
+			errObj["request_id"] = strings.TrimSpace(requestID)
+		}
+	}
+	if c != nil {
+		if layer, ok := c.Get(openAIRateLimitLayerContextKey); ok {
+			if v, ok := layer.(string); ok && strings.TrimSpace(v) != "" {
+				errObj["rate_limit_layer"] = strings.TrimSpace(v)
+			}
+		}
+		if upstreamStatus, ok := c.Get(openAIRateLimitUpstreamStatusKey); ok {
+			if v, ok := upstreamStatus.(string); ok && strings.TrimSpace(v) != "" {
+				errObj["upstream_status_code"] = strings.TrimSpace(v)
+			}
+		}
+		if upstreamRID, ok := c.Get(openAIRateLimitUpstreamRequestIDKey); ok {
+			if v, ok := upstreamRID.(string); ok && strings.TrimSpace(v) != "" {
+				errObj["upstream_request_id"] = strings.TrimSpace(v)
+			}
+		}
+	}
+	c.JSON(status, gin.H{"error": errObj})
 }
 
 // openAICompactKeepaliveInterval 复用流式 keepalive 配置作为 compact 下游

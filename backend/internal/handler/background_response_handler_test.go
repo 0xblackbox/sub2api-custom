@@ -15,6 +15,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 type backgroundResponseHandlerMemoryStore struct {
@@ -107,6 +108,24 @@ func TestBackgroundResponseSubmitSurvivesDisconnectAndPollsFinalResult(t *testin
 	require.Contains(t, pollWriter.Body.String(), "SUBTOPROXY_OK")
 	require.Contains(t, pollWriter.Body.String(), accepted.ID)
 	require.NotContains(t, pollWriter.Body.String(), "resp_upstream")
+}
+
+func TestBackgroundResponseFinalResponseFromSSEPreservesWebSearchAddedSources(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"OpenAI","sources":[{"type":"url","url":"https://developers.openai.com/api/docs/guides/tools-web-search","title":"Web search"}]}}}`,
+		"",
+		`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}`,
+		"",
+		`data: {"type":"response.completed","response":{"id":"resp_upstream","object":"response","status":"completed","output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`,
+		"",
+	}, "\n")
+
+	finalResponse, ok := backgroundResponseFinalResponseFromSSE([]byte(body), "resp_bg_test")
+	require.True(t, ok)
+	require.Equal(t, "web_search_call", gjson.GetBytes(finalResponse, "output.0.type").String())
+	require.Equal(t, "https://developers.openai.com/api/docs/guides/tools-web-search", gjson.GetBytes(finalResponse, "output.0.action.sources.0.url").String())
+	require.Equal(t, "message", gjson.GetBytes(finalResponse, "output.1.type").String())
+	require.Equal(t, int64(2), gjson.GetBytes(finalResponse, "output.#").Int())
 }
 
 func TestBackgroundResponseStreamingFailedEventBecomesTerminalFailure(t *testing.T) {

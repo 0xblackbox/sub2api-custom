@@ -334,18 +334,12 @@ func backgroundResponseFinalResponseFromSSE(body []byte, fallbackID string) (jso
 			}
 		case "response.output_item.done":
 			item := gjson.GetBytes(data, "item")
-			if !item.Exists() || !item.IsObject() || item.Raw == "" {
-				return
+			backgroundResponseAppendOutputItem(item, &outputItems, seenItems)
+		case "response.output_item.added":
+			item := gjson.GetBytes(data, "item")
+			if backgroundResponseOutputItemCanUseAddedFallback(item.Get("type").String()) {
+				backgroundResponseAppendOutputItem(item, &outputItems, seenItems)
 			}
-			key := strings.TrimSpace(item.Get("id").String())
-			if key == "" {
-				key = item.Raw
-			}
-			if _, ok := seenItems[key]; ok {
-				return
-			}
-			seenItems[key] = struct{}{}
-			outputItems = append(outputItems, json.RawMessage(item.Raw))
 		case "response.completed", "response.done":
 			if finalResponse != nil {
 				return
@@ -371,6 +365,89 @@ func backgroundResponseFinalResponseFromSSE(body []byte, fallbackID string) (jso
 	return json.RawMessage(finalResponse), true
 }
 
+func backgroundResponseAppendOutputItem(item gjson.Result, outputItems *[]json.RawMessage, seenItems map[string]struct{}) {
+	if !item.Exists() || !item.IsObject() || item.Raw == "" || outputItems == nil {
+		return
+	}
+	key := backgroundResponseOutputItemKey(item)
+	if _, ok := seenItems[key]; ok {
+		return
+	}
+	seenItems[key] = struct{}{}
+	*outputItems = append(*outputItems, json.RawMessage(item.Raw))
+}
+
+func backgroundResponseOutputItemKey(item gjson.Result) string {
+	key := strings.TrimSpace(item.Get("id").String())
+	if key == "" {
+		key = item.Raw
+	}
+	return key
+}
+
+func backgroundResponseOutputItemCanUseAddedFallback(itemType string) bool {
+	switch strings.TrimSpace(itemType) {
+	case "web_search_call",
+		"file_search_call",
+		"image_generation_call",
+		"code_interpreter_call",
+		"computer_call",
+		"mcp_call",
+		"mcp_approval_request",
+		"mcp_list_tools",
+		"local_shell_call",
+		"custom_tool_call",
+		"compaction",
+		"compaction_summary":
+		return true
+	default:
+		return false
+	}
+}
+
+func backgroundResponseMergeOutputItems(response []byte, collected []json.RawMessage) []byte {
+	if len(collected) == 0 || !gjson.ValidBytes(response) {
+		return response
+	}
+	merged := make([]json.RawMessage, 0, len(collected)+len(gjson.GetBytes(response, "output").Array()))
+	seen := make(map[string]struct{}, len(collected))
+	for _, raw := range collected {
+		if len(raw) == 0 || !json.Valid(raw) {
+			continue
+		}
+		item := gjson.ParseBytes(raw)
+		key := backgroundResponseOutputItemKey(item)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, raw)
+	}
+	for _, item := range gjson.GetBytes(response, "output").Array() {
+		if !item.IsObject() || item.Raw == "" {
+			continue
+		}
+		key := backgroundResponseOutputItemKey(item)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, json.RawMessage(item.Raw))
+	}
+	if len(merged) == 0 {
+		return response
+	}
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return response
+	}
+	updated, err := sjson.SetRawBytes(response, "output", encoded)
+	if err != nil {
+		return response
+	}
+	return updated
+}
+
 func backgroundResponseNormalizeCompletedResponse(response []byte, fallbackID, outputText string, outputItems []json.RawMessage) []byte {
 	if !gjson.ValidBytes(response) {
 		return response
@@ -393,6 +470,9 @@ func backgroundResponseNormalizeCompletedResponse(response []byte, fallbackID, o
 	}
 	output := gjson.GetBytes(updated, "output")
 	if output.Exists() && output.IsArray() && len(output.Array()) > 0 {
+		if len(outputItems) > 0 {
+			updated = backgroundResponseMergeOutputItems(updated, outputItems)
+		}
 		return updated
 	}
 	if len(outputItems) > 0 {

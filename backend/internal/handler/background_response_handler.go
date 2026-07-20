@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -26,15 +27,80 @@ import (
 // the SSE stream server-side, and stores the final Response object in Redis for
 // later polling.
 type BackgroundResponseHandler struct {
-	tasks   *service.BackgroundResponseTaskService
-	openAI  *OpenAIGatewayHandler
-	execute func(c *gin.Context)
+	tasks      *service.BackgroundResponseTaskService
+	openAI     *OpenAIGatewayHandler
+	execute    func(c *gin.Context)
+	heavyQueue *backgroundResponseHeavyQueue
 }
 
 func NewBackgroundResponseHandler(tasks *service.BackgroundResponseTaskService, openAI *OpenAIGatewayHandler) *BackgroundResponseHandler {
-	h := &BackgroundResponseHandler{tasks: tasks, openAI: openAI}
+	h := &BackgroundResponseHandler{tasks: tasks, openAI: openAI, heavyQueue: defaultBackgroundResponseHeavyQueue}
 	h.execute = h.executeWithGateway
 	return h
+}
+
+const backgroundResponseUserSlotWaitTimeoutKey = "subtoproxy_background_response_user_slot_wait_timeout"
+
+var defaultBackgroundResponseHeavyQueue = newBackgroundResponseHeavyQueue()
+
+type backgroundResponseHeavyQueue struct {
+	global chan struct{}
+
+	mu    sync.Mutex
+	users map[int64]chan struct{}
+}
+
+func newBackgroundResponseHeavyQueue() *backgroundResponseHeavyQueue {
+	return &backgroundResponseHeavyQueue{
+		global: make(chan struct{}, 1),
+		users:  make(map[int64]chan struct{}),
+	}
+}
+
+func (q *backgroundResponseHeavyQueue) acquire(ctx context.Context, userID int64) (func(), time.Duration, error) {
+	if q == nil {
+		return func() {}, 0, nil
+	}
+	start := time.Now()
+	select {
+	case q.global <- struct{}{}:
+	case <-ctx.Done():
+		return nil, time.Since(start), ctx.Err()
+	}
+
+	userCh := q.userChannel(userID)
+	select {
+	case userCh <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				<-userCh
+				<-q.global
+			})
+		}, time.Since(start), nil
+	case <-ctx.Done():
+		<-q.global
+		return nil, time.Since(start), ctx.Err()
+	}
+}
+
+func (q *backgroundResponseHeavyQueue) userChannel(userID int64) chan struct{} {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	ch := q.users[userID]
+	if ch == nil {
+		ch = make(chan struct{}, 1)
+		q.users[userID] = ch
+	}
+	return ch
+}
+
+func (h *BackgroundResponseHandler) acquireHeavyWebSearchQueue(ctx context.Context, userID int64) (func(), time.Duration, error) {
+	q := defaultBackgroundResponseHeavyQueue
+	if h != nil && h.heavyQueue != nil {
+		q = h.heavyQueue
+	}
+	return q.acquire(ctx, userID)
 }
 
 // TrySubmit returns true when it handled the request. For a normal Responses
@@ -59,14 +125,24 @@ func (h *BackgroundResponseHandler) TrySubmit(c *gin.Context) bool {
 	}
 	restoreBackgroundResponseRequestBody(c.Request, body)
 	background := gjson.GetBytes(body, "background")
-	if !background.Exists() || background.Type != gjson.True {
+	if background.Exists() && background.Type == gjson.True {
+		h.submit(c, body, backgroundResponseSubmitOptions{})
+		return true
+	}
+	reqStream, ok := parseOpenAICompatibleStream(body)
+	if !ok || reqStream || !backgroundResponseIsHeavyWebSearch(body) {
 		return false
 	}
-	h.submit(c, body)
+	h.submit(c, body, backgroundResponseSubmitOptions{autoBackground: true, heavyWebSearch: true})
 	return true
 }
 
-func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte) {
+type backgroundResponseSubmitOptions struct {
+	autoBackground bool
+	heavyWebSearch bool
+}
+
+func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte, opts backgroundResponseSubmitOptions) {
 	if h == nil || h.tasks == nil || !h.tasks.Enabled() || h.execute == nil {
 		backgroundResponseError(c, service.ErrBackgroundResponseUnavailable)
 		return
@@ -80,9 +156,11 @@ func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte) {
 		backgroundResponseJSONError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
-	if store := gjson.GetBytes(body, "store"); store.Exists() && store.Type == gjson.False {
-		backgroundResponseJSONError(c, http.StatusBadRequest, "invalid_request_error", "background responses require store=true")
-		return
+	if !opts.autoBackground {
+		if store := gjson.GetBytes(body, "store"); store.Exists() && store.Type == gjson.False {
+			backgroundResponseJSONError(c, http.StatusBadRequest, "invalid_request_error", "background responses require store=true")
+			return
+		}
 	}
 	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
 	if !ok || apiKey == nil || apiKey.UserID <= 0 || apiKey.ID <= 0 {
@@ -107,9 +185,15 @@ func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte) {
 	c.Header("Cache-Control", "no-store")
 	c.Header("Location", backgroundResponsePollURL(c.Request.URL.Path, task.ID))
 	c.Header("Retry-After", "3")
+	if opts.autoBackground {
+		c.Header("X-SubtoProxy-Auto-Background", "true")
+	}
+	if opts.heavyWebSearch {
+		c.Header("X-SubtoProxy-Background-Queue", "heavy_web_search")
+	}
 	c.JSON(http.StatusOK, backgroundResponsePendingPayload(task))
 
-	go h.run(task.ID, taskCtx, recorder, cancel)
+	go h.run(task.ID, taskCtx, recorder, cancel, apiKey.UserID, opts)
 }
 
 func (h *BackgroundResponseHandler) Get(c *gin.Context) {
@@ -151,7 +235,7 @@ func (h *BackgroundResponseHandler) executeWithGateway(c *gin.Context) {
 	h.openAI.Responses(c)
 }
 
-func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, recorder *httptest.ResponseRecorder, cancel context.CancelFunc) {
+func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, recorder *httptest.ResponseRecorder, cancel context.CancelFunc, userID int64, opts backgroundResponseSubmitOptions) {
 	defer cancel()
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -159,6 +243,26 @@ func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, rec
 			h.failTask(taskID, http.StatusInternalServerError, backgroundResponseErrorPayload("api_error", "background response panicked"))
 		}
 	}()
+	if opts.heavyWebSearch {
+		release, queueWait, err := h.acquireHeavyWebSearchQueue(taskCtx.Request.Context(), userID)
+		if err != nil {
+			logger.L().Warn("background_response.heavy_queue_acquire_failed",
+				zap.String("response_id", taskID),
+				zap.Int64("user_id", userID),
+				zap.Int64("queue_wait_ms", queueWait.Milliseconds()),
+				zap.Error(err),
+			)
+			h.failTask(taskID, http.StatusServiceUnavailable, backgroundResponseErrorPayload("proxy_heavy_queue_timeout", "heavy web search queue timed out before execution"))
+			return
+		}
+		defer release()
+		taskCtx.Set(backgroundResponseUserSlotWaitTimeoutKey, h.tasks.ExecutionTimeout())
+		logger.L().Info("background_response.heavy_queue_acquired",
+			zap.String("response_id", taskID),
+			zap.Int64("user_id", userID),
+			zap.Int64("queue_wait_ms", queueWait.Milliseconds()),
+		)
+	}
 	if err := h.tasks.MarkInProgress(context.Background(), taskID); err != nil {
 		logger.L().Error("background_response.mark_processing_failed", zap.String("response_id", taskID), zap.Error(err))
 	}
@@ -222,6 +326,75 @@ func normalizeBackgroundResponseExecutionBody(body []byte) ([]byte, error) {
 		return nil, err
 	}
 	return body, nil
+}
+
+func backgroundResponseIsHeavyWebSearch(body []byte) bool {
+	if !gjson.ValidBytes(body) {
+		return false
+	}
+	contract := service.OpenAIResponsesNativeContract(body)
+	if !contract.HasHostedWebSearch {
+		return false
+	}
+	if !backgroundResponseHasHighReasoning(body) {
+		return false
+	}
+	if !backgroundResponseHasHighSearchContext(body) {
+		return false
+	}
+	if maxOutputTokens := gjson.GetBytes(body, "max_output_tokens").Int(); maxOutputTokens > 0 && maxOutputTokens < 4000 {
+		return false
+	}
+	return backgroundResponseRequiresToolUse(body, contract.ToolChoice)
+}
+
+func backgroundResponseHasHighReasoning(body []byte) bool {
+	switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").String())) {
+	case "high", "xhigh", "max", "ultra":
+		return true
+	default:
+		return false
+	}
+}
+
+func backgroundResponseHasHighSearchContext(body []byte) bool {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		toolType := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
+		if toolType == "" {
+			toolType = strings.ToLower(strings.TrimSpace(tool.Get("name").String()))
+		}
+		if !strings.HasPrefix(toolType, "web_search") {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(tool.Get("search_context_size").String())) {
+		case "high", "medium":
+			return true
+		case "":
+			return true
+		}
+	}
+	return false
+}
+
+func backgroundResponseRequiresToolUse(body []byte, summaryToolChoice string) bool {
+	toolChoice := gjson.GetBytes(body, "tool_choice")
+	if !toolChoice.Exists() {
+		return false
+	}
+	if toolChoice.Type == gjson.String {
+		switch strings.ToLower(strings.TrimSpace(toolChoice.String())) {
+		case "required", "web_search", "web_search_preview":
+			return true
+		default:
+			return false
+		}
+	}
+	summaryToolChoice = strings.ToLower(strings.TrimSpace(summaryToolChoice))
+	return summaryToolChoice == "required" || strings.Contains(summaryToolChoice, "web_search")
 }
 
 func newBackgroundResponseContext(c *gin.Context, body []byte, timeoutDuration time.Duration) (*gin.Context, *httptest.ResponseRecorder, context.CancelFunc) {

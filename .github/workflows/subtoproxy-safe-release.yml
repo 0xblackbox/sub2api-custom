@@ -47,6 +47,9 @@ jobs:
           if [[ "$official_version" == "0.1.161" ]]; then
             revision=4
           fi
+          if [[ "$official_version" == "0.1.162" ]]; then
+            revision=1
+          fi
           custom_version="${official_version}-custom.${revision}"
           custom_tag="v${custom_version}"
           echo "official_tag=$official_tag" >> "$GITHUB_OUTPUT"

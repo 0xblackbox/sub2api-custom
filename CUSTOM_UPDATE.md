@@ -1,7 +1,8 @@
 # SubtoProxy 安全更新通道
 
 这个分支在官方 Sub2API 的基础上保留 `POST /v1/responses` 的
-`background=true, store=true` 兼容层，并把网页更新功能固定到：
+`background=true, store=true` 兼容层，并增加 Responses 重型 Web Search
+的独立排队、取消、后台轮询和脱敏可观测性。网页更新功能固定到：
 
 `0xblackbox/sub2api-custom`
 

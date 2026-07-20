@@ -245,6 +245,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	recordResponsesIngressOnce(c, body, "responses_post")
 
 	setOpsRequestContext(c, "", false)
 	sessionHashBody := body
@@ -377,6 +378,14 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 	routingStart := time.Now()
+
+	heavyReleaseFunc, heavyAcquired := h.acquireResponsesHeavyWebSearchSlot(c, body, subject.UserID, apiKey.ID, reqLog)
+	if !heavyAcquired {
+		return
+	}
+	if heavyReleaseFunc != nil {
+		defer heavyReleaseFunc()
+	}
 
 	userReleaseFunc, acquired := h.acquireResponsesUserSlot(c, subject.UserID, subject.Concurrency, reqStream, &streamStarted, reqLog)
 	if !acquired {
@@ -1313,6 +1322,15 @@ func (h *OpenAIGatewayHandler) acquireResponsesUserSlot(
 	streamStarted *bool,
 	reqLog *zap.Logger,
 ) (func(), bool) {
+	if skip, _ := c.Get(responsesSkipUserSlotKey); skip == true {
+		if reqLog != nil {
+			reqLog.Info("openai.user_slot_skipped_for_heavy_web_search",
+				zap.Int64("user_id", userID),
+				zap.Int("user_concurrency", userConcurrency),
+			)
+		}
+		return nil, true
+	}
 	ctx := c.Request.Context()
 	userReleaseFunc, err := h.concurrencyHelper.AcquireUserSlotWithWait(c, userID, userConcurrency, reqStream, streamStarted)
 	if err != nil {
@@ -2176,6 +2194,25 @@ func (h *OpenAIGatewayHandler) acquireImageGenerationSlot(c *gin.Context, stream
 
 // handleConcurrencyError handles concurrency-related acquire errors.
 func (h *OpenAIGatewayHandler) handleConcurrencyError(c *gin.Context, err error, slotType string, streamStarted bool) {
+	if slotType == "user" {
+		var concurrencyErr *ConcurrencyError
+		var waitQueueFullErr *WaitQueueFullError
+		switch {
+		case errors.As(err, &concurrencyErr) && concurrencyErr.IsTimeout:
+			c.Header("Retry-After", "3")
+			markOpenAIRateLimitLayer(c, "proxy_user_concurrency", http.StatusTooManyRequests, "")
+			h.handleStreamingAwareError(c, http.StatusTooManyRequests, "proxy_user_concurrency_timeout", "timeout waiting for user concurrency slot", streamStarted)
+			return
+		case errors.As(err, &waitQueueFullErr):
+			c.Header("Retry-After", "3")
+			markOpenAIRateLimitLayer(c, "proxy_user_concurrency", http.StatusTooManyRequests, "")
+			h.handleStreamingAwareError(c, http.StatusTooManyRequests, "proxy_user_concurrency_timeout", "too many pending user requests, please retry later", streamStarted)
+			return
+		case errors.Is(err, context.Canceled):
+			h.handleStreamingAwareError(c, statusClientClosedRequest, "downstream_client_cancelled", "client disconnected while waiting for user concurrency slot", streamStarted)
+			return
+		}
+	}
 	status, errType, message := concurrencyErrorResponse(err, slotType)
 	if status == http.StatusTooManyRequests {
 		markOpenAIRateLimitLayer(c, "proxy_concurrency", status, "")

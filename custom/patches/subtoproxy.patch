@@ -1,5 +1,5 @@
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
-index 96eb7c417..ffa6d7472 100644
+index 96eb7c41..ffa6d747 100644
 --- a/backend/cmd/server/wire_gen.go
 +++ b/backend/cmd/server/wire_gen.go
 @@ -283,6 +283,9 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
@@ -22,7 +22,7 @@ index 96eb7c417..ffa6d7472 100644
  	adminAuthMiddleware := middleware.NewAdminAuthMiddleware(authService, userService, settingService, auditLogService)
  	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, subscriptionService, configConfig)
 diff --git a/backend/internal/handler/admin/system_handler.go b/backend/internal/handler/admin/system_handler.go
-index 6afa29f05..45a0d92fe 100644
+index 6afa29f0..45a0d92f 100644
 --- a/backend/internal/handler/admin/system_handler.go
 +++ b/backend/internal/handler/admin/system_handler.go
 @@ -18,8 +18,9 @@ import (
@@ -69,7 +69,7 @@ index 6afa29f05..45a0d92fe 100644
  		}, nil
  	})
 diff --git a/backend/internal/handler/admin/system_handler_test.go b/backend/internal/handler/admin/system_handler_test.go
-index fabee82d8..c615302bc 100644
+index fabee82d..c615302b 100644
 --- a/backend/internal/handler/admin/system_handler_test.go
 +++ b/backend/internal/handler/admin/system_handler_test.go
 @@ -75,6 +75,8 @@ type systemUpdateResponseEnvelope struct {
@@ -124,18 +124,1004 @@ index fabee82d8..c615302bc 100644
  func requireSystemLockStatus(t *testing.T, repo *memoryIdempotencyRepoStub, wantStatus string) {
  	t.Helper()
  	repo.mu.Lock()
+diff --git a/backend/internal/handler/gateway_helper.go b/backend/internal/handler/gateway_helper.go
+index 1f6daf52..5059f871 100644
+--- a/backend/internal/handler/gateway_helper.go
++++ b/backend/internal/handler/gateway_helper.go
+@@ -241,7 +241,15 @@ func (h *ConcurrencyHelper) TryAcquireAccountSlot(ctx context.Context, accountID
+ // For streaming requests, sends ping events during the wait.
+ // streamStarted is updated if streaming response has begun.
+ func (h *ConcurrencyHelper) AcquireUserSlotWithWait(c *gin.Context, userID int64, maxConcurrency int, isStream bool, streamStarted *bool) (func(), error) {
+-	return h.acquireUserSlotWithWaitTimeout(c, userID, maxConcurrency, maxConcurrencyWait, isStream, streamStarted)
++	timeout := maxConcurrencyWait
++	if c != nil {
++		if raw, ok := c.Get(backgroundResponseUserSlotWaitTimeoutKey); ok {
++			if requested, ok := raw.(time.Duration); ok && requested > timeout {
++				timeout = requested
++			}
++		}
++	}
++	return h.acquireUserSlotWithWaitTimeout(c, userID, maxConcurrency, timeout, isStream, streamStarted)
+ }
+ 
+ func (h *ConcurrencyHelper) acquireUserSlotWithWaitTimeout(c *gin.Context, userID int64, maxConcurrency int, timeout time.Duration, isStream bool, streamStarted *bool) (func(), error) {
+diff --git a/backend/internal/handler/handler.go b/backend/internal/handler/handler.go
+index 13d3076b..9a2a7e29 100644
+--- a/backend/internal/handler/handler.go
++++ b/backend/internal/handler/handler.go
+@@ -45,24 +45,25 @@ type AdminHandlers struct {
+ 
+ // Handlers contains all HTTP handlers
+ type Handlers struct {
+-	Auth             *AuthHandler
+-	User             *UserHandler
+-	APIKey           *APIKeyHandler
+-	Usage            *UsageHandler
+-	Redeem           *RedeemHandler
+-	Subscription     *SubscriptionHandler
+-	Announcement     *AnnouncementHandler
+-	ChannelMonitor   *ChannelMonitorUserHandler
+-	Admin            *AdminHandlers
+-	Gateway          *GatewayHandler
+-	OpenAIGateway    *OpenAIGatewayHandler
+-	Setting          *SettingHandler
+-	Totp             *TotpHandler
+-	Payment          *PaymentHandler
+-	PaymentWebhook   *PaymentWebhookHandler
+-	AvailableChannel *AvailableChannelHandler
+-	AsyncImage       *AsyncImageHandler
+-	BatchImage       *BatchImageHandler
++	Auth               *AuthHandler
++	User               *UserHandler
++	APIKey             *APIKeyHandler
++	Usage              *UsageHandler
++	Redeem             *RedeemHandler
++	Subscription       *SubscriptionHandler
++	Announcement       *AnnouncementHandler
++	ChannelMonitor     *ChannelMonitorUserHandler
++	Admin              *AdminHandlers
++	Gateway            *GatewayHandler
++	OpenAIGateway      *OpenAIGatewayHandler
++	Setting            *SettingHandler
++	Totp               *TotpHandler
++	Payment            *PaymentHandler
++	PaymentWebhook     *PaymentWebhookHandler
++	AvailableChannel   *AvailableChannelHandler
++	AsyncImage         *AsyncImageHandler
++	BackgroundResponse *BackgroundResponseHandler
++	BatchImage         *BatchImageHandler
+ }
+ 
+ // BuildInfo contains build-time information
+diff --git a/backend/internal/handler/openai_gateway_handler.go b/backend/internal/handler/openai_gateway_handler.go
+index 7b697d6d..0772bb23 100644
+--- a/backend/internal/handler/openai_gateway_handler.go
++++ b/backend/internal/handler/openai_gateway_handler.go
+@@ -47,7 +47,38 @@ type grokMediaEligibilityProber interface {
+ 	ProbeMediaEligibility(ctx context.Context, accountID int64) (bool, string, error)
+ }
+ 
+-const maxOpenAIFirstOutputTimeoutSwitches = 1
++const (
++	maxOpenAIFirstOutputTimeoutSwitches = 1
++
++	openAIRateLimitLayerContextKey      = "openai_rate_limit_layer"
++	openAIRateLimitUpstreamRequestIDKey = "openai_rate_limit_upstream_request_id"
++	openAIRateLimitUpstreamStatusKey    = "openai_rate_limit_upstream_status"
++	openAIRateLimitLayerHeader          = "X-RateLimit-Layer"
++	openAIUpstreamStatusCodeHeader      = "X-Upstream-Status-Code"
++	openAIUpstreamRequestIDHeader       = "X-Upstream-Request-ID"
++)
++
++func markOpenAIRateLimitLayer(c *gin.Context, layer string, upstreamStatus int, upstreamRequestID string) {
++	if c == nil {
++		return
++	}
++	layer = strings.TrimSpace(layer)
++	if layer == "" {
++		return
++	}
++	c.Set(openAIRateLimitLayerContextKey, layer)
++	c.Header(openAIRateLimitLayerHeader, layer)
++	if upstreamStatus > 0 {
++		status := strconv.Itoa(upstreamStatus)
++		c.Set(openAIRateLimitUpstreamStatusKey, status)
++		c.Header(openAIUpstreamStatusCodeHeader, status)
++	}
++	upstreamRequestID = strings.TrimSpace(upstreamRequestID)
++	if upstreamRequestID != "" && !strings.ContainsAny(upstreamRequestID, "\r\n") && len(upstreamRequestID) <= 128 {
++		c.Set(openAIRateLimitUpstreamRequestIDKey, upstreamRequestID)
++		c.Header(openAIUpstreamRequestIDHeader, upstreamRequestID)
++	}
++}
+ 
+ func openAIForwardSucceededForScheduling(result *service.OpenAIForwardResult) bool {
+ 	return result.SucceededForScheduling()
+@@ -226,6 +257,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
+ 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
+ 		return
+ 	}
++	recordResponsesIngressOnce(c, body, "responses_post")
+ 
+ 	setOpsRequestContext(c, "", false)
+ 	sessionHashBody := body
+@@ -259,7 +291,25 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
+ 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
+ 		return
+ 	}
+-	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
++	nativeContract := service.OpenAIResponsesNativeContract(body)
++	if nativeContract.RequiresNativeResponses {
++		c.Set("openai_responses_requires_native", true)
++	}
++	if nativeContract.HasHostedWebSearch {
++		c.Set("openai_responses_has_web_search", true)
++	}
++	if nativeContract.RequestsWebSearchSources {
++		c.Set("openai_responses_include_web_search_sources", true)
++	}
++	reqLog = reqLog.With(
++		zap.String("model", reqModel),
++		zap.Bool("stream", reqStream),
++		zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
++		zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
++		zap.Bool("requires_native_responses", nativeContract.RequiresNativeResponses),
++		zap.Bool("background", nativeContract.Background),
++		zap.String("tool_choice", nativeContract.ToolChoice),
++	)
+ 	previousResponseID := strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
+ 	if previousResponseID != "" {
+ 		previousResponseIDKind := service.ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
+@@ -314,6 +364,15 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
+ 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
+ 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)
+ 	seedOpenAIForwardImageIntentHint(c, channelMapping.Mapped, imageIntent)
++	if channelMapping.Mapped {
++		reqLog = reqLog.With(
++			zap.Bool("model_mapping_applied", true),
++			zap.String("mapped_model", channelMapping.MappedModel),
++		)
++		c.Set("openai_mapped_model", channelMapping.MappedModel)
++	} else {
++		reqLog = reqLog.With(zap.Bool("model_mapping_applied", false))
++	}
+ 
+ 	// 提前校验 function_call_output 是否具备可关联上下文，避免上游 400。
+ 	if !h.validateFunctionCallOutputRequest(c, body, reqLog) {
+@@ -332,6 +391,14 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
+ 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
+ 	routingStart := time.Now()
+ 
++	heavyReleaseFunc, heavyAcquired := h.acquireResponsesHeavyWebSearchSlot(c, body, subject.UserID, apiKey.ID, reqLog)
++	if !heavyAcquired {
++		return
++	}
++	if heavyReleaseFunc != nil {
++		defer heavyReleaseFunc()
++	}
++
+ 	userReleaseFunc, acquired := h.acquireResponsesUserSlot(c, subject.UserID, subject.Concurrency, reqStream, &streamStarted, reqLog)
+ 	if !acquired {
+ 		return
+@@ -371,8 +438,14 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
+ 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
+ 	// 仅对 OpenAI 平台生效：Grok 生图走独立的 forwardGrokResponses 路径，不应被过滤。
+ 	// 复用前置权限与并发阶段在未修改 body 上确认的显式生图意图，避免大 tools 请求重复扫描。
+-	// 该判断已排除 Codex 被动 image_gen namespace，避免 CC-only 账号被误过滤（#4476）。
++	// native Responses 合同（例如 web_search_call.action.sources）同样必须路由到 Responses 能力账号，不能降级到 Chat Completions。
+ 	requiredCapability := openAIResponsesRequiredCapability(imageIntent, requestPlatform)
++	if requestPlatform == service.PlatformOpenAI && nativeContract.RequiresNativeResponses {
++		requiredCapability = service.OpenAIEndpointCapabilityResponses
++	}
++	reqLog.Debug("openai.responses_request_features",
++		zap.String("required_capability", string(requiredCapability)),
++	)
+ 
+ 	for {
+ 		// Streaming Forward intentionally detaches the upstream request so usage can
+@@ -860,7 +933,25 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
+ 	preferredMappedModel := resolveOpenAIMessagesDispatchMappedModel(apiKey, reqModel)
+ 	reqStream := gjson.GetBytes(body, "stream").Bool()
+ 
+-	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
++	nativeContract := service.OpenAIResponsesNativeContract(body)
++	if nativeContract.RequiresNativeResponses {
++		c.Set("openai_responses_requires_native", true)
++	}
++	if nativeContract.HasHostedWebSearch {
++		c.Set("openai_responses_has_web_search", true)
++	}
++	if nativeContract.RequestsWebSearchSources {
++		c.Set("openai_responses_include_web_search_sources", true)
++	}
++	reqLog = reqLog.With(
++		zap.String("model", reqModel),
++		zap.Bool("stream", reqStream),
++		zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
++		zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
++		zap.Bool("requires_native_responses", nativeContract.RequiresNativeResponses),
++		zap.Bool("background", nativeContract.Background),
++		zap.String("tool_choice", nativeContract.ToolChoice),
++	)
+ 
+ 	setOpsRequestContext(c, reqModel, reqStream)
+ 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
+@@ -1260,6 +1351,15 @@ func (h *OpenAIGatewayHandler) acquireResponsesUserSlot(
+ 	streamStarted *bool,
+ 	reqLog *zap.Logger,
+ ) (func(), bool) {
++	if skip, _ := c.Get(responsesSkipUserSlotKey); skip == true {
++		if reqLog != nil {
++			reqLog.Info("openai.user_slot_skipped_for_heavy_web_search",
++				zap.Int64("user_id", userID),
++				zap.Int("user_concurrency", userConcurrency),
++			)
++		}
++		return nil, true
++	}
+ 	ctx := c.Request.Context()
+ 	userReleaseFunc, err := h.concurrencyHelper.AcquireUserSlotWithWait(c, userID, userConcurrency, reqStream, streamStarted)
+ 	if err != nil {
+@@ -1321,6 +1421,7 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
+ 			zap.Int64("account_id", account.ID),
+ 			zap.Int("max_waiting", selection.WaitPlan.MaxWaiting),
+ 		)
++		markOpenAIRateLimitLayer(c, "proxy_queue", http.StatusTooManyRequests, "")
+ 		h.handleStreamingAwareError(c, http.StatusTooManyRequests, "rate_limit_error", "Too many pending requests, please retry later", *streamStarted)
+ 		return nil, false
+ 	}
+@@ -1334,6 +1435,7 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
+ 	}
+ 	defer releaseWait()
+ 
++	queueWaitStart := time.Now()
+ 	accountReleaseFunc, err := h.concurrencyHelper.AcquireAccountSlotWithWaitTimeout(
+ 		c,
+ 		account.ID,
+@@ -1343,10 +1445,19 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
+ 		streamStarted,
+ 	)
+ 	if err != nil {
+-		reqLog.Warn("openai.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
++		reqLog.Warn("openai.account_slot_acquire_failed",
++			zap.Int64("account_id", account.ID),
++			zap.Int64("queue_wait_ms", time.Since(queueWaitStart).Milliseconds()),
++			zap.Error(err),
++		)
+ 		h.handleConcurrencyError(c, err, "account", *streamStarted)
+ 		return nil, false
+ 	}
++	reqLog.Debug("openai.account_slot_acquired_after_wait",
++		zap.Int64("account_id", account.ID),
++		zap.Int64("queue_wait_ms", time.Since(queueWaitStart).Milliseconds()),
++		zap.Int("max_concurrency", selection.WaitPlan.MaxConcurrency),
++	)
+ 
+ 	// Slot acquired: no longer waiting in queue.
+ 	releaseWait()
+@@ -2112,7 +2223,29 @@ func (h *OpenAIGatewayHandler) acquireImageGenerationSlot(c *gin.Context, stream
+ 
+ // handleConcurrencyError handles concurrency-related acquire errors.
+ func (h *OpenAIGatewayHandler) handleConcurrencyError(c *gin.Context, err error, slotType string, streamStarted bool) {
++	if slotType == "user" {
++		var concurrencyErr *ConcurrencyError
++		var waitQueueFullErr *WaitQueueFullError
++		switch {
++		case errors.As(err, &concurrencyErr) && concurrencyErr.IsTimeout:
++			c.Header("Retry-After", "3")
++			markOpenAIRateLimitLayer(c, "proxy_user_concurrency", http.StatusTooManyRequests, "")
++			h.handleStreamingAwareError(c, http.StatusTooManyRequests, "proxy_user_concurrency_timeout", "timeout waiting for user concurrency slot", streamStarted)
++			return
++		case errors.As(err, &waitQueueFullErr):
++			c.Header("Retry-After", "3")
++			markOpenAIRateLimitLayer(c, "proxy_user_concurrency", http.StatusTooManyRequests, "")
++			h.handleStreamingAwareError(c, http.StatusTooManyRequests, "proxy_user_concurrency_timeout", "too many pending user requests, please retry later", streamStarted)
++			return
++		case errors.Is(err, context.Canceled):
++			h.handleStreamingAwareError(c, statusClientClosedRequest, "downstream_client_cancelled", "client disconnected while waiting for user concurrency slot", streamStarted)
++			return
++		}
++	}
+ 	status, errType, message := concurrencyErrorResponse(err, slotType)
++	if status == http.StatusTooManyRequests {
++		markOpenAIRateLimitLayer(c, "proxy_concurrency", status, "")
++	}
+ 	h.handleStreamingAwareError(c, status, errType, message, streamStarted)
+ }
+ 
+@@ -2133,6 +2266,9 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
+ 		return
+ 	}
+ 	copyFailoverRetryAfter(c, failoverErr.ResponseHeaders)
++	if failoverErr.StatusCode == http.StatusTooManyRequests {
++		markOpenAIRateLimitLayer(c, "upstream", failoverErr.StatusCode, failoverErr.ResponseHeaders.Get("x-request-id"))
++	}
+ 	if failoverErr.IsCredentialFailure() {
+ 		status, message := credentialFailoverClientResponse(failoverErr)
+ 		h.handleStreamingAwareError(c, status, "upstream_error", message, streamStarted)
+@@ -2218,6 +2354,9 @@ func isSafeRetryAfter(value string) bool {
+ func (h *OpenAIGatewayHandler) handleFailoverExhaustedSimple(c *gin.Context, statusCode int, streamStarted bool) {
+ 	status, errType, errMsg := h.mapUpstreamError(statusCode)
+ 	service.SetOpsUpstreamError(c, statusCode, errMsg, "")
++	if statusCode == http.StatusTooManyRequests {
++		markOpenAIRateLimitLayer(c, "upstream", statusCode, "")
++	}
+ 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
+ }
+ 
+@@ -2435,12 +2574,33 @@ func (h *OpenAIGatewayHandler) errorResponse(c *gin.Context, status int, errType
+ 			return
+ 		}
+ 	}
+-	c.JSON(status, gin.H{
+-		"error": gin.H{
+-			"type":    errType,
+-			"message": message,
+-		},
+-	})
++	errObj := gin.H{
++		"type":    errType,
++		"message": message,
++	}
++	if c != nil && c.Request != nil {
++		if requestID, _ := c.Request.Context().Value(ctxkey.ClientRequestID).(string); strings.TrimSpace(requestID) != "" {
++			errObj["request_id"] = strings.TrimSpace(requestID)
++		}
++	}
++	if c != nil {
++		if layer, ok := c.Get(openAIRateLimitLayerContextKey); ok {
++			if v, ok := layer.(string); ok && strings.TrimSpace(v) != "" {
++				errObj["rate_limit_layer"] = strings.TrimSpace(v)
++			}
++		}
++		if upstreamStatus, ok := c.Get(openAIRateLimitUpstreamStatusKey); ok {
++			if v, ok := upstreamStatus.(string); ok && strings.TrimSpace(v) != "" {
++				errObj["upstream_status_code"] = strings.TrimSpace(v)
++			}
++		}
++		if upstreamRID, ok := c.Get(openAIRateLimitUpstreamRequestIDKey); ok {
++			if v, ok := upstreamRID.(string); ok && strings.TrimSpace(v) != "" {
++				errObj["upstream_request_id"] = strings.TrimSpace(v)
++			}
++		}
++	}
++	c.JSON(status, gin.H{"error": errObj})
+ }
+ 
+ // openAICompactKeepaliveInterval 复用流式 keepalive 配置作为 compact 下游
+diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
+index 54d82a69..45c75ae5 100644
+--- a/backend/internal/handler/wire.go
++++ b/backend/internal/handler/wire.go
+@@ -181,29 +181,31 @@ func ProvideHandlers(
+ 	paymentWebhookHandler *PaymentWebhookHandler,
+ 	availableChannelHandler *AvailableChannelHandler,
+ 	asyncImageHandler *AsyncImageHandler,
++	backgroundResponseHandler *BackgroundResponseHandler,
+ 	batchImageHandler *BatchImageHandler,
+ 	_ *service.IdempotencyCoordinator,
+ 	_ *service.IdempotencyCleanupService,
+ ) *Handlers {
+ 	return &Handlers{
+-		Auth:             authHandler,
+-		User:             userHandler,
+-		APIKey:           apiKeyHandler,
+-		Usage:            usageHandler,
+-		Redeem:           redeemHandler,
+-		Subscription:     subscriptionHandler,
+-		Announcement:     announcementHandler,
+-		ChannelMonitor:   channelMonitorUserHandler,
+-		Admin:            adminHandlers,
+-		Gateway:          gatewayHandler,
+-		OpenAIGateway:    openaiGatewayHandler,
+-		Setting:          settingHandler,
+-		Totp:             totpHandler,
+-		Payment:          paymentHandler,
+-		PaymentWebhook:   paymentWebhookHandler,
+-		AvailableChannel: availableChannelHandler,
+-		AsyncImage:       asyncImageHandler,
+-		BatchImage:       batchImageHandler,
++		Auth:               authHandler,
++		User:               userHandler,
++		APIKey:             apiKeyHandler,
++		Usage:              usageHandler,
++		Redeem:             redeemHandler,
++		Subscription:       subscriptionHandler,
++		Announcement:       announcementHandler,
++		ChannelMonitor:     channelMonitorUserHandler,
++		Admin:              adminHandlers,
++		Gateway:            gatewayHandler,
++		OpenAIGateway:      openaiGatewayHandler,
++		Setting:            settingHandler,
++		Totp:               totpHandler,
++		Payment:            paymentHandler,
++		PaymentWebhook:     paymentWebhookHandler,
++		AvailableChannel:   availableChannelHandler,
++		AsyncImage:         asyncImageHandler,
++		BackgroundResponse: backgroundResponseHandler,
++		BatchImage:         batchImageHandler,
+ 	}
+ }
+ 
+@@ -226,6 +228,7 @@ var ProviderSet = wire.NewSet(
+ 	NewPaymentWebhookHandler,
+ 	NewAvailableChannelHandler,
+ 	NewAsyncImageHandler,
++	NewBackgroundResponseHandler,
+ 	ProvideBatchImageHandler,
+ 
+ 	// Admin handlers
+diff --git a/backend/internal/repository/wire.go b/backend/internal/repository/wire.go
+index 1ee3194a..ef7fc9a4 100644
+--- a/backend/internal/repository/wire.go
++++ b/backend/internal/repository/wire.go
+@@ -121,6 +121,7 @@ var ProviderSet = wire.NewSet(
+ 	NewUpdateCache,
+ 	NewGeminiTokenCache,
+ 	NewImageTaskStore,
++	NewBackgroundResponseTaskStore,
+ 	NewBatchImageQueue,
+ 	NewBatchImageDownloadLimiter,
+ 	NewLeaderLockCache,
+diff --git a/backend/internal/server/middleware/api_key_auth.go b/backend/internal/server/middleware/api_key_auth.go
+index a595fbdb..49e05258 100644
+--- a/backend/internal/server/middleware/api_key_auth.go
++++ b/backend/internal/server/middleware/api_key_auth.go
+@@ -28,7 +28,7 @@ func NewAPIKeyAuthMiddleware(apiKeyService *service.APIKeyService, subscriptionS
+ //   - 鉴权（Authentication）：验证 Key 有效性、用户状态、IP 限制 —— 始终执行
+ //   - 计费执行（Billing Enforcement）：过期/配额/订阅/余额检查 —— skipBilling 时整块跳过
+ //
+-// /v1/usage、/v1/sub2api/billing 端点与异步生图任务查询只需鉴权，不需要计费执行。
++// /v1/usage、/v1/sub2api/billing 端点与异步任务查询只需鉴权，不需要计费执行。
+ // usage 允许过期/配额耗尽的 Key 查询自身用量，billing 用于读取当前 Key 的倍率配置，
+ // 异步生图查询允许已耗尽额度的 Key 拉取自身任务结果。
+ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscriptionService *service.SubscriptionService, cfg *config.Config) gin.HandlerFunc {
+@@ -169,7 +169,7 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
+ 		// Async image task polling only reads data that already belongs to the
+ 		// authenticated key and must remain available after the completed
+ 		// generation consumes the key's remaining balance.
+-		skipBilling := c.Request.URL.Path == "/v1/usage" || billingInfoRequest || isAsyncImageTaskRead(c.Request.Method, c.Request.URL.Path)
++		skipBilling := c.Request.URL.Path == "/v1/usage" || billingInfoRequest || isAsyncImageTaskRead(c.Request.Method, c.Request.URL.Path) || isBackgroundResponseRead(c.Request.Method, c.Request.URL.Path)
+ 
+ 		// ── 4. SimpleMode → early return ─────────────────────────────
+ 
+@@ -340,6 +340,18 @@ func isAsyncImageTaskRead(method, path string) bool {
+ 	return strings.HasPrefix(path, "/v1/images/tasks/") || strings.HasPrefix(path, "/images/tasks/")
+ }
+ 
++func isBackgroundResponseRead(method, path string) bool {
++	if method != http.MethodGet {
++		return false
++	}
++	for _, prefix := range []string{"/v1/responses/", "/responses/"} {
++		if strings.HasPrefix(path, prefix) && strings.TrimPrefix(path, prefix) != "" {
++			return true
++		}
++	}
++	return false
++}
++
+ // GetAPIKeyFromContext 从上下文中获取API key
+ func GetAPIKeyFromContext(c *gin.Context) (*service.APIKey, bool) {
+ 	value, exists := c.Get(string(ContextKeyAPIKey))
+diff --git a/backend/internal/server/middleware/api_key_auth_image_task_test.go b/backend/internal/server/middleware/api_key_auth_image_task_test.go
+index 653fd8ba..aa0bfd76 100644
+--- a/backend/internal/server/middleware/api_key_auth_image_task_test.go
++++ b/backend/internal/server/middleware/api_key_auth_image_task_test.go
+@@ -13,3 +13,12 @@ func TestIsAsyncImageTaskRead(t *testing.T) {
+ 	require.False(t, isAsyncImageTaskRead(http.MethodPost, "/v1/images/tasks/imgtask_123"))
+ 	require.False(t, isAsyncImageTaskRead(http.MethodGet, "/v1/images/generations"))
+ }
++
++func TestIsBackgroundResponseRead(t *testing.T) {
++	require.True(t, isBackgroundResponseRead(http.MethodGet, "/v1/responses/resp_bg_123"))
++	require.True(t, isBackgroundResponseRead(http.MethodGet, "/responses/resp_bg_123"))
++	require.False(t, isBackgroundResponseRead(http.MethodPost, "/v1/responses/resp_bg_123"))
++	require.False(t, isBackgroundResponseRead(http.MethodGet, "/v1/responses"))
++	// Similar prefixes must not accidentally bypass billing enforcement.
++	require.False(t, isBackgroundResponseRead(http.MethodGet, "/v1/responses-archive/resp_bg_123"))
++}
+diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
+index 8e14f1d5..f616553d 100644
+--- a/backend/internal/server/routes/gateway.go
++++ b/backend/internal/server/routes/gateway.go
+@@ -160,6 +160,9 @@ func RegisterGatewayRoutes(
+ 		// OpenAI Responses API: auto-route based on group platform
+ 		gateway.POST("/responses", func(c *gin.Context) {
+ 			if isOpenAIResponsesCompatibleGatewayPlatform(c) {
++				if h.BackgroundResponse != nil && h.BackgroundResponse.TrySubmit(c) {
++					return
++				}
+ 				h.OpenAIGateway.Responses(c)
+ 				return
+ 			}
+@@ -167,11 +170,22 @@ func RegisterGatewayRoutes(
+ 		})
+ 		gateway.POST("/responses/*subpath", func(c *gin.Context) {
+ 			if isOpenAIResponsesCompatibleGatewayPlatform(c) {
++				if h.BackgroundResponse != nil && h.BackgroundResponse.TryCancel(c) {
++					return
++				}
+ 				h.OpenAIGateway.Responses(c)
+ 				return
+ 			}
+ 			h.Gateway.Responses(c)
+ 		})
++		gateway.GET("/responses/:response_id", func(c *gin.Context) {
++			if !isOpenAIResponsesCompatibleGatewayPlatform(c) || h.BackgroundResponse == nil {
++				service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalFeatureGate)
++				c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"type": "not_found_error", "message": "Response not found"}})
++				return
++			}
++			h.BackgroundResponse.Get(c)
++		})
+ 		gateway.POST("/alpha/search", textBodyLimit, h.OpenAIGateway.AlphaSearch)
+ 		gateway.GET("/responses", func(c *gin.Context) {
+ 			h.OpenAIGateway.ResponsesWebSocket(c)
+@@ -237,6 +251,12 @@ func RegisterGatewayRoutes(
+ 	// OpenAI Responses API（不带v1前缀的别名）— auto-route based on group platform
+ 	responsesHandler := func(c *gin.Context) {
+ 		if isOpenAIResponsesCompatibleGatewayPlatform(c) {
++			if h.BackgroundResponse != nil && h.BackgroundResponse.TryCancel(c) {
++				return
++			}
++			if h.BackgroundResponse != nil && h.BackgroundResponse.TrySubmit(c) {
++				return
++			}
+ 			h.OpenAIGateway.Responses(c)
+ 			return
+ 		}
+@@ -244,6 +264,14 @@ func RegisterGatewayRoutes(
+ 	}
+ 	r.POST("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
+ 	r.POST("/responses/*subpath", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
++	r.GET("/responses/:response_id", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++		if !isOpenAIResponsesCompatibleGatewayPlatform(c) || h.BackgroundResponse == nil {
++			service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalFeatureGate)
++			c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"type": "not_found_error", "message": "Response not found"}})
++			return
++		}
++		h.BackgroundResponse.Get(c)
++	})
+ 	r.POST("/alpha/search", textBodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.OpenAIGateway.AlphaSearch)
+ 	r.GET("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
+ 		h.OpenAIGateway.ResponsesWebSocket(c)
+diff --git a/backend/internal/service/openai_gateway_forward.go b/backend/internal/service/openai_gateway_forward.go
+index 93697be7..b32ed413 100644
+--- a/backend/internal/service/openai_gateway_forward.go
++++ b/backend/internal/service/openai_gateway_forward.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/tidwall/gjson"
++	"go.uber.org/zap"
+ )
+ 
+ // Forward forwards request to OpenAI API
+@@ -76,12 +77,31 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 	requestView := newOpenAIRequestView(body)
+ 	reqModel, reqStream, promptCacheKey := requestView.Model, requestView.Stream, requestView.PromptCacheKey
+ 	originalModel := reqModel
++	nativeContract := OpenAIResponsesNativeContract(body)
+ 
+ 	if account.Platform == PlatformGrok {
+ 		return s.forwardGrokResponses(ctx, c, account, body, originalModel, reqStream, startTime)
+ 	}
+ 
+ 	if account.Type == AccountTypeAPIKey && !openai_compat.ShouldUseResponsesAPI(account.Extra) {
++		if nativeContract.RequiresNativeResponses {
++			if c != nil {
++				c.Set("openai_responses_requires_native", true)
++				c.Set("openai_responses_has_web_search", nativeContract.HasHostedWebSearch)
++				c.Set("openai_responses_include_web_search_sources", nativeContract.RequestsWebSearchSources)
++			}
++			logger.L().Warn("openai responses: refusing chat completions fallback for native-only request",
++				zap.Int64("account_id", account.ID),
++				zap.String("account_name", account.Name),
++				zap.String("original_model", originalModel),
++				zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
++				zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
++				zap.Bool("background", nativeContract.Background),
++				zap.String("tool_choice", nativeContract.ToolChoice),
++			)
++			writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "upstream_configuration_error", "Selected upstream only supports Chat Completions fallback and cannot preserve native Responses hosted tool output")
++			return nil, errors.New("responses request requires native /v1/responses upstream")
++		}
+ 		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body)
+ 	}
+ 
+diff --git a/backend/internal/service/openai_gateway_response_handling.go b/backend/internal/service/openai_gateway_response_handling.go
+index 2acf0a93..ccc6be6f 100644
+--- a/backend/internal/service/openai_gateway_response_handling.go
++++ b/backend/internal/service/openai_gateway_response_handling.go
+@@ -1450,18 +1450,22 @@ func responsesStreamEventMayContributeToOutput(eventType string) bool {
+ 	}
+ }
+ 
+-// collectRawResponsesOutputItemsFromSSE 按到达顺序收集 SSE 流中
+-// response.output_item.done 携带的原始 item。除已产生结果但仍停留在进行中
+-// 的图片状态外，item 以 raw JSON 逐字节保留，
+-// 避免经窄结构体重建时丢弃 encrypted_content/summary/opaque 等 compact
+-// 专属或未来新增字段（#3777 问题 2）。若整条流没有任何 done 事件，退回
+-// 收集 output_item.added 中的 compaction 类 item——compaction 结果没有
+-// delta 事件，部分上游只在 added 事件中携带完整 item。
++// collectRawResponsesOutputItemsFromSSE 按到达顺序收集 SSE 流中的原始 output
++// item。response.output_item.done 是权威终态；对没有 delta 的 hosted tool
++// item（例如 web_search_call.action.sources、compaction）允许用
++// response.output_item.added 兜底。item 以 raw JSON 逐字节保留，避免经窄
++// 结构体重建时丢弃 action.sources、encrypted_content、summary 或未来新增字段。
+ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
+-	var items []json.RawMessage
+-	seen := make(map[string]struct{})
+-	hasCompactionItem := false
+-	appendItem := func(item gjson.Result) {
++	type rawOutputItemCandidate struct {
++		raw      json.RawMessage
++		fromDone bool
++	}
++	itemsByKey := make(map[string]rawOutputItemCandidate)
++	order := make([]string, 0, 4)
++	deferredAddedOrder := make([]string, 0, 1)
++	deferredAddedSeen := make(map[string]struct{})
++	hasDoneCompaction := false
++	appendOrReplace := func(item gjson.Result, fromDone bool, deferAddedOrder bool) {
+ 		if !item.Exists() || !item.IsObject() {
+ 			return
+ 		}
+@@ -1469,38 +1473,71 @@ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
+ 		if key == "" {
+ 			key = item.Raw
+ 		}
+-		if _, dup := seen[key]; dup {
++		existing, exists := itemsByKey[key]
++		if exists && existing.fromDone {
+ 			return
+ 		}
+-		seen[key] = struct{}{}
+-		if isResponsesCompactionItemType(item.Get("type").String()) {
+-			hasCompactionItem = true
++		if !fromDone && exists {
++			return
++		}
++		if !exists && !deferAddedOrder {
++			order = append(order, key)
+ 		}
+-		items = append(items, json.RawMessage(item.Raw))
++		if !exists && deferAddedOrder {
++			if _, seenDeferred := deferredAddedSeen[key]; !seenDeferred {
++				deferredAddedSeen[key] = struct{}{}
++				deferredAddedOrder = append(deferredAddedOrder, key)
++			}
++		}
++		itemsByKey[key] = rawOutputItemCandidate{raw: json.RawMessage(item.Raw), fromDone: fromDone}
+ 	}
+ 	forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
+ 		if normalized, changed := normalizeCompletedImageGenerationStatus(data); changed {
+ 			data = normalized
+ 		}
+-		if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.done" {
+-			return
++		eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
++		item := gjson.GetBytes(data, "item")
++		switch eventType {
++		case "response.output_item.done":
++			if isResponsesCompactionItemType(item.Get("type").String()) {
++				hasDoneCompaction = true
++			}
++			appendOrReplace(item, true, false)
++		case "response.output_item.added":
++			// message/function_call/reasoning items are assembled from deltas or
++			// later done events; taking their early added form would create empty
++			// or partial output. Hosted tool calls are atomic in added/done events
++			// and must be kept even when a terminal response has output:[].
++			if responsesOutputItemCanUseAddedFallback(item.Get("type").String()) {
++				appendOrReplace(item, false, isResponsesCompactionItemType(item.Get("type").String()))
++			}
+ 		}
+-		appendItem(gjson.GetBytes(data, "item"))
+ 	})
+-	// done 事件未携带 compaction item 时再看 added：覆盖"其他 item 有 done、
+-	// compaction 只在 added 中"的混合形态；done 已含 compaction 时跳过，
+-	// 避免同一 item 在无 id 可去重时被收集两份（Codex 要求恰好一个）。
+-	if !hasCompactionItem {
+-		forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
+-			if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.added" {
+-				return
++	if len(deferredAddedOrder) > 0 {
++		seenOrder := make(map[string]struct{}, len(order))
++		for _, key := range order {
++			seenOrder[key] = struct{}{}
++		}
++		for _, key := range deferredAddedOrder {
++			if _, seen := seenOrder[key]; seen {
++				continue
+ 			}
+-			item := gjson.GetBytes(data, "item")
+-			if !isResponsesCompactionItemType(item.Get("type").String()) {
+-				return
++			if hasDoneCompaction {
++				if candidate, ok := itemsByKey[key]; ok && isResponsesCompactionItemType(gjson.GetBytes(candidate.raw, "type").String()) {
++					continue
++				}
+ 			}
+-			appendItem(item)
+-		})
++			order = append(order, key)
++		}
++	}
++	if len(order) == 0 {
++		return nil, false
++	}
++	items := make([]json.RawMessage, 0, len(order))
++	for _, key := range order {
++		if candidate, ok := itemsByKey[key]; ok && len(candidate.raw) > 0 {
++			items = append(items, candidate.raw)
++		}
+ 	}
+ 	if len(items) == 0 {
+ 		return nil, false
+@@ -1512,6 +1549,26 @@ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
+ 	return outputJSON, true
+ }
+ 
++func responsesOutputItemCanUseAddedFallback(itemType string) bool {
++	switch strings.TrimSpace(itemType) {
++	case "web_search_call",
++		"file_search_call",
++		"image_generation_call",
++		"code_interpreter_call",
++		"computer_call",
++		"mcp_call",
++		"mcp_approval_request",
++		"mcp_list_tools",
++		"local_shell_call",
++		"custom_tool_call",
++		"compaction",
++		"compaction_summary":
++		return true
++	default:
++		return false
++	}
++}
++
+ // isResponsesCompactionItemType reports whether the item type is the Codex
+ // remote-compact result item ("compaction", upstream alias "compaction_summary").
+ func isResponsesCompactionItemType(itemType string) bool {
+diff --git a/backend/internal/service/openai_gateway_responses_chat_fallback.go b/backend/internal/service/openai_gateway_responses_chat_fallback.go
+index 1082b020..027d2ac1 100644
+--- a/backend/internal/service/openai_gateway_responses_chat_fallback.go
++++ b/backend/internal/service/openai_gateway_responses_chat_fallback.go
+@@ -25,6 +25,11 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
+ 	body []byte,
+ ) (*OpenAIForwardResult, error) {
+ 	startTime := time.Now()
++	if OpenAIResponsesRequestRequiresNativeResponses(body) {
++		msg := "Responses request requires native /v1/responses hosted tool output; Chat Completions fallback cannot preserve web_search_call.action.sources"
++		writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "upstream_configuration_error", msg)
++		return nil, errors.New("responses request requires native /v1/responses upstream")
++	}
+ 
+ 	var responsesReq apicompat.ResponsesRequest
+ 	if err := json.Unmarshal(body, &responsesReq); err != nil {
+diff --git a/backend/internal/service/update_service.go b/backend/internal/service/update_service.go
+index 82df3bb0..a6b88575 100644
+--- a/backend/internal/service/update_service.go
++++ b/backend/internal/service/update_service.go
+@@ -25,12 +25,17 @@ import (
+ var (
+ 	ErrNoUpdateAvailable         = infraerrors.Conflict("ALREADY_UP_TO_DATE", "no update available; current version is latest")
+ 	ErrRollbackVersionNotAllowed = infraerrors.BadRequest("ROLLBACK_VERSION_NOT_ALLOWED", "version is not in the allowed rollback list")
++	ErrCustomBuildUpdateDisabled = infraerrors.Conflict("CUSTOM_BUILD_UPDATE_DISABLED", "direct official updates are disabled for this custom build; use the SubtoProxy custom update channel")
+ )
+ 
+ const (
+ 	updateCacheKey = "update_check_cache"
+ 	updateCacheTTL = 1200 // 20 minutes
+-	githubRepo     = "Wei-Shaw/sub2api"
++	// githubRepo is intentionally pinned to the SubtoProxy custom release
++	// channel. Release builds must never download the upstream binary directly,
++	// because doing so would overwrite the background-response compatibility
++	// layer carried by this fork.
++	githubRepo = "0xblackbox/sub2api-custom"
+ 
+ 	// Security: allowed download domains for updates
+ 	allowedDownloadHost = "github.com"
+@@ -163,6 +168,9 @@ func (s *UpdateService) CheckUpdate(ctx context.Context, force bool) (*UpdateInf
+ // PerformUpdate downloads and applies the update
+ // Uses atomic file replacement pattern for safe in-place updates
+ func (s *UpdateService) PerformUpdate(ctx context.Context) error {
++	if s == nil || s.buildType != "release" {
++		return ErrCustomBuildUpdateDisabled
++	}
+ 	info, err := s.CheckUpdate(ctx, true)
+ 	if err != nil {
+ 		return err
+@@ -281,6 +289,9 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
+ 
+ // Rollback restores the previous version
+ func (s *UpdateService) Rollback() error {
++	if s == nil || s.buildType != "release" {
++		return ErrCustomBuildUpdateDisabled
++	}
+ 	exePath, err := os.Executable()
+ 	if err != nil {
+ 		return fmt.Errorf("failed to get executable path: %w", err)
+@@ -327,6 +338,9 @@ func (s *UpdateService) ListRollbackVersions(ctx context.Context) ([]RollbackVer
+ // The target must be one of the versions returned by ListRollbackVersions;
+ // anything else (including the current version) is rejected.
+ func (s *UpdateService) RollbackToVersion(ctx context.Context, version string) error {
++	if s == nil || s.buildType != "release" {
++		return ErrCustomBuildUpdateDisabled
++	}
+ 	target := strings.TrimPrefix(strings.TrimSpace(version), "v")
+ 	if target == "" {
+ 		return ErrRollbackVersionNotAllowed
+@@ -643,23 +657,50 @@ func compareVersions(current, latest string) int {
+ 	latestParts := parseVersion(latest)
+ 
+ 	for i := 0; i < 3; i++ {
+-		if currentParts[i] < latestParts[i] {
++		if currentParts.core[i] < latestParts.core[i] {
+ 			return -1
+ 		}
+-		if currentParts[i] > latestParts[i] {
++		if currentParts.core[i] > latestParts.core[i] {
+ 			return 1
+ 		}
+ 	}
++
++	// Custom channel releases use versions such as 0.1.160-custom.3. The old
++	// parser treated "160-custom" as zero, which made every custom revision
++	// look identical. For the same upstream base version, a custom build is
++	// considered newer than the unpatched upstream build, and custom revisions
++	// are ordered numerically.
++	if currentParts.customRevision < latestParts.customRevision {
++		return -1
++	}
++	if currentParts.customRevision > latestParts.customRevision {
++		return 1
++	}
+ 	return 0
+ }
+ 
+-func parseVersion(v string) [3]int {
++type parsedUpdateVersion struct {
++	core           [3]int
++	customRevision int
++}
++
++func parseVersion(v string) parsedUpdateVersion {
+ 	v = strings.TrimPrefix(v, "v")
+-	parts := strings.Split(v, ".")
+-	result := [3]int{0, 0, 0}
++	v = strings.SplitN(v, "+", 2)[0]
++	versionAndSuffix := strings.SplitN(v, "-", 2)
++	parts := strings.Split(versionAndSuffix[0], ".")
++	result := parsedUpdateVersion{}
+ 	for i := 0; i < len(parts) && i < 3; i++ {
+ 		if parsed, err := strconv.Atoi(parts[i]); err == nil {
+-			result[i] = parsed
++			result.core[i] = parsed
++		}
++	}
++	if len(versionAndSuffix) == 2 {
++		suffixParts := strings.Split(versionAndSuffix[1], ".")
++		if len(suffixParts) == 2 && suffixParts[0] == "custom" {
++			if revision, err := strconv.Atoi(suffixParts[1]); err == nil && revision > 0 {
++				result.customRevision = revision
++			}
+ 		}
+ 	}
+ 	return result
+diff --git a/backend/internal/service/update_service_test.go b/backend/internal/service/update_service_test.go
+index 243e25d1..490b9709 100644
+--- a/backend/internal/service/update_service_test.go
++++ b/backend/internal/service/update_service_test.go
+@@ -69,6 +69,40 @@ func TestUpdateServicePerformUpdateNoUpdateReturnsSentinel(t *testing.T) {
+ 	require.ErrorIs(t, err, ErrNoUpdateAvailable)
+ }
+ 
++func TestUpdateServiceCustomBuildRejectsOfficialBinaryReplacement(t *testing.T) {
++	svc := NewUpdateService(
++		&updateServiceCacheStub{},
++		&updateServiceGitHubClientStub{},
++		"0.1.160-custom.1",
++		"source",
++	)
++
++	require.ErrorIs(t, svc.PerformUpdate(context.Background()), ErrCustomBuildUpdateDisabled)
++	require.ErrorIs(t, svc.Rollback(), ErrCustomBuildUpdateDisabled)
++	require.ErrorIs(t, svc.RollbackToVersion(context.Background(), "0.1.159"), ErrCustomBuildUpdateDisabled)
++}
++
++func TestCompareVersionsOrdersCustomChannelRevisions(t *testing.T) {
++	tests := []struct {
++		current string
++		latest  string
++		want    int
++	}{
++		{current: "0.1.160-custom.2", latest: "0.1.160-custom.3", want: -1},
++		{current: "v0.1.160-custom.10", latest: "0.1.160-custom.3", want: 1},
++		{current: "0.1.160", latest: "0.1.160-custom.1", want: -1},
++		{current: "0.1.160-custom.3", latest: "0.1.161-custom.1", want: -1},
++		{current: "0.1.161-custom.1", latest: "0.1.160-custom.99", want: 1},
++		{current: "0.1.160-custom.3+build.7", latest: "0.1.160-custom.3", want: 0},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.current+"_vs_"+tt.latest, func(t *testing.T) {
++			require.Equal(t, tt.want, compareVersions(tt.current, tt.latest))
++		})
++	}
++}
++
+ func newRollbackTestService(current string, releases []*GitHubRelease) *UpdateService {
+ 	return NewUpdateService(
+ 		&updateServiceCacheStub{},
+diff --git a/backend/internal/service/wire.go b/backend/internal/service/wire.go
+index 913cb6ba..a0961d1d 100644
+--- a/backend/internal/service/wire.go
++++ b/backend/internal/service/wire.go
+@@ -696,6 +696,7 @@ var ProviderSet = wire.NewSet(
+ 	NewOpenAIGatewayService,
+ 	ProvideImageStorageSettingService,
+ 	ProvideImageTaskService,
++	NewBackgroundResponseTaskService,
+ 	ProvideBatchImageModelPricingResolver,
+ 	NewBatchImagePublicService,
+ 	NewBatchImageDownloadService,
+diff --git a/frontend/src/api/admin/system.ts b/frontend/src/api/admin/system.ts
+index 1c057c84..34c3ec51 100644
+--- a/frontend/src/api/admin/system.ts
++++ b/frontend/src/api/admin/system.ts
+@@ -43,6 +43,7 @@ export async function checkUpdates(force = false): Promise<VersionInfo> {
+ export interface UpdateResult {
+   message: string
+   need_restart: boolean
++  auto_restart?: boolean
+ }
+ 
+ export interface RollbackVersionInfo {
+diff --git a/frontend/src/components/common/VersionBadge.vue b/frontend/src/components/common/VersionBadge.vue
+index 7fd62947..5b4ffd09 100644
+--- a/frontend/src/components/common/VersionBadge.vue
++++ b/frontend/src/components/common/VersionBadge.vue
+@@ -765,6 +765,9 @@ async function handleUpdate() {
+     needRestart.value = result.need_restart
+     // Clear version cache to reflect update completed
+     appStore.clearVersionCache()
++    if (result.auto_restart) {
++      beginRestartCountdown()
++    }
+   } catch (error: unknown) {
+     const err = error as { response?: { data?: { message?: string } }; message?: string }
+     updateError.value = err.response?.data?.message || err.message || t('version.updateFailed')
+@@ -862,6 +865,12 @@ async function handleRestart() {
+     console.log('Service restarting...')
+   }
+ 
++  beginRestartCountdown()
++}
++
++function beginRestartCountdown() {
++  restarting.value = true
++  restartCountdown.value = 8
+   // Start countdown
+   const countdownInterval = setInterval(() => {
+     restartCountdown.value--
 diff --git a/backend/internal/handler/background_response_handler.go b/backend/internal/handler/background_response_handler.go
 new file mode 100644
-index 000000000..8a61535b3
+index 00000000..11ae9950
 --- /dev/null
 +++ b/backend/internal/handler/background_response_handler.go
-@@ -0,0 +1,868 @@
+@@ -0,0 +1,1145 @@
 +package handler
 +
 +import (
 +	"bytes"
 +	"context"
 +	"encoding/json"
++	"errors"
 +	"io"
 +	"net/http"
 +	"net/http/httptest"
@@ -163,29 +1149,55 @@ index 000000000..8a61535b3
 +	openAI     *OpenAIGatewayHandler
 +	execute    func(c *gin.Context)
 +	heavyQueue *backgroundResponseHeavyQueue
++	running    sync.Map // response_id -> context.CancelFunc
 +}
 +
 +func NewBackgroundResponseHandler(tasks *service.BackgroundResponseTaskService, openAI *OpenAIGatewayHandler) *BackgroundResponseHandler {
 +	h := &BackgroundResponseHandler{tasks: tasks, openAI: openAI, heavyQueue: defaultBackgroundResponseHeavyQueue}
 +	h.execute = h.executeWithGateway
++	h.failActiveBackgroundTasksOnStartup()
 +	return h
 +}
 +
-+const backgroundResponseUserSlotWaitTimeoutKey = "subtoproxy_background_response_user_slot_wait_timeout"
++const (
++	backgroundResponseUserSlotWaitTimeoutKey = "subtoproxy_background_response_user_slot_wait_timeout"
++	responsesSkipUserSlotKey                 = "subtoproxy_responses_skip_user_slot"
++	responsesHeavySlotAlreadyAcquiredKey     = "subtoproxy_responses_heavy_slot_already_acquired"
++)
 +
 +var defaultBackgroundResponseHeavyQueue = newBackgroundResponseHeavyQueue()
 +
-+type backgroundResponseHeavyQueue struct {
-+	global chan struct{}
++var errBackgroundHeavyQueueFull = errors.New("heavy web search queue full")
 +
-+	mu    sync.Mutex
-+	users map[int64]chan struct{}
++type backgroundResponseHeavyQueue struct {
++	global          chan struct{}
++	perUserCapacity int
++	maxWaiting      int
++
++	mu      sync.Mutex
++	users   map[int64]chan struct{}
++	waiting int
 +}
 +
 +func newBackgroundResponseHeavyQueue() *backgroundResponseHeavyQueue {
++	return newBackgroundResponseHeavyQueueWithOptions(1, 1, 64)
++}
++
++func newBackgroundResponseHeavyQueueWithOptions(globalConcurrency, perUserConcurrency, maxWaiting int) *backgroundResponseHeavyQueue {
++	if globalConcurrency <= 0 {
++		globalConcurrency = 1
++	}
++	if perUserConcurrency <= 0 {
++		perUserConcurrency = 1
++	}
++	if maxWaiting < 0 {
++		maxWaiting = 0
++	}
 +	return &backgroundResponseHeavyQueue{
-+		global: make(chan struct{}, 1),
-+		users:  make(map[int64]chan struct{}),
++		global:          make(chan struct{}, globalConcurrency),
++		perUserCapacity: perUserConcurrency,
++		maxWaiting:      maxWaiting,
++		users:           make(map[int64]chan struct{}),
 +	}
 +}
 +
@@ -194,25 +1206,76 @@ index 000000000..8a61535b3
 +		return func() {}, 0, nil
 +	}
 +	start := time.Now()
++	userCh := q.userChannel(userID)
++
++	if release, ok := q.tryAcquire(userCh); ok {
++		return release, time.Since(start), nil
++	}
++	if !q.reserveWaitingSlot() {
++		return nil, time.Since(start), errBackgroundHeavyQueueFull
++	}
++	defer q.releaseWaitingSlot()
++
 +	select {
-+	case q.global <- struct{}{}:
++	case userCh <- struct{}{}:
 +	case <-ctx.Done():
 +		return nil, time.Since(start), ctx.Err()
 +	}
++	select {
++	case q.global <- struct{}{}:
++		return q.releaseFunc(userCh), time.Since(start), nil
++	case <-ctx.Done():
++		<-userCh
++		return nil, time.Since(start), ctx.Err()
++	}
++}
 +
-+	userCh := q.userChannel(userID)
++func (q *backgroundResponseHeavyQueue) tryAcquire(userCh chan struct{}) (func(), bool) {
 +	select {
 +	case userCh <- struct{}{}:
-+		var once sync.Once
-+		return func() {
-+			once.Do(func() {
-+				<-userCh
-+				<-q.global
-+			})
-+		}, time.Since(start), nil
-+	case <-ctx.Done():
-+		<-q.global
-+		return nil, time.Since(start), ctx.Err()
++	default:
++		return nil, false
++	}
++	select {
++	case q.global <- struct{}{}:
++		return q.releaseFunc(userCh), true
++	default:
++		<-userCh
++		return nil, false
++	}
++}
++
++func (q *backgroundResponseHeavyQueue) releaseFunc(userCh chan struct{}) func() {
++	var once sync.Once
++	return func() {
++		once.Do(func() {
++			<-q.global
++			<-userCh
++		})
++	}
++}
++
++func (q *backgroundResponseHeavyQueue) canAcceptWaitingSlot() bool {
++	q.mu.Lock()
++	defer q.mu.Unlock()
++	return q.waiting < q.maxWaiting
++}
++
++func (q *backgroundResponseHeavyQueue) reserveWaitingSlot() bool {
++	q.mu.Lock()
++	defer q.mu.Unlock()
++	if q.waiting >= q.maxWaiting {
++		return false
++	}
++	q.waiting++
++	return true
++}
++
++func (q *backgroundResponseHeavyQueue) releaseWaitingSlot() {
++	q.mu.Lock()
++	defer q.mu.Unlock()
++	if q.waiting > 0 {
++		q.waiting--
 +	}
 +}
 +
@@ -221,10 +1284,19 @@ index 000000000..8a61535b3
 +	defer q.mu.Unlock()
 +	ch := q.users[userID]
 +	if ch == nil {
-+		ch = make(chan struct{}, 1)
++		ch = make(chan struct{}, q.perUserCapacity)
 +		q.users[userID] = ch
 +	}
 +	return ch
++}
++
++func (q *backgroundResponseHeavyQueue) waitingCount() int {
++	if q == nil {
++		return 0
++	}
++	q.mu.Lock()
++	defer q.mu.Unlock()
++	return q.waiting
 +}
 +
 +func (h *BackgroundResponseHandler) acquireHeavyWebSearchQueue(ctx context.Context, userID int64) (func(), time.Duration, error) {
@@ -233,6 +1305,24 @@ index 000000000..8a61535b3
 +		q = h.heavyQueue
 +	}
 +	return q.acquire(ctx, userID)
++}
++
++func (h *BackgroundResponseHandler) failActiveBackgroundTasksOnStartup() {
++	if h == nil || h.tasks == nil || !h.tasks.Enabled() {
++		return
++	}
++	go func() {
++		failed, err := h.tasks.FailActiveOnStartup(context.Background(), 1000)
++		fields := []zap.Field{zap.Int("failed_active_tasks", failed)}
++		if err != nil {
++			fields = append(fields, zap.Error(err))
++			logger.L().Warn("background_response.startup_recovery_failed", fields...)
++			return
++		}
++		if failed > 0 {
++			logger.L().Warn("background_response.startup_recovered_active_tasks", fields...)
++		}
++	}()
 +}
 +
 +// TrySubmit returns true when it handled the request. For a normal Responses
@@ -258,15 +1348,11 @@ index 000000000..8a61535b3
 +	restoreBackgroundResponseRequestBody(c.Request, body)
 +	background := gjson.GetBytes(body, "background")
 +	if background.Exists() && background.Type == gjson.True {
-+		h.submit(c, body, backgroundResponseSubmitOptions{})
++		recordResponsesIngressOnce(c, body, "responses_post")
++		h.submit(c, body, backgroundResponseSubmitOptions{heavyWebSearch: backgroundResponseIsHeavyWebSearch(body)})
 +		return true
 +	}
-+	reqStream, ok := parseOpenAICompatibleStream(body)
-+	if !ok || reqStream || !backgroundResponseIsHeavyWebSearch(body) {
-+		return false
-+	}
-+	h.submit(c, body, backgroundResponseSubmitOptions{autoBackground: true, heavyWebSearch: true})
-+	return true
++	return false
 +}
 +
 +type backgroundResponseSubmitOptions struct {
@@ -299,6 +1385,17 @@ index 000000000..8a61535b3
 +		backgroundResponseJSONError(c, http.StatusUnauthorized, "authentication_error", "Invalid API key")
 +		return
 +	}
++	if opts.heavyWebSearch {
++		q := defaultBackgroundResponseHeavyQueue
++		if h.heavyQueue != nil {
++			q = h.heavyQueue
++		}
++		if q != nil && !q.canAcceptWaitingSlot() {
++			c.Header("Retry-After", "3")
++			backgroundResponseJSONError(c, http.StatusTooManyRequests, "proxy_heavy_queue_full", "heavy web search queue is full, please retry later")
++			return
++		}
++	}
 +
 +	// The gateway itself owns persistence. Do not ask subscription/OAuth
 +	// upstreams to implement OpenAI's background lifecycle as well.
@@ -313,6 +1410,7 @@ index 000000000..8a61535b3
 +		return
 +	}
 +	taskCtx, recorder, cancel := newBackgroundResponseContext(c, executionBody, h.tasks.ExecutionTimeout())
++	taskCtx.Set(responsesInternalBackgroundExecuteKey, true)
 +
 +	c.Header("Cache-Control", "no-store")
 +	c.Header("Location", backgroundResponsePollURL(c.Request.URL.Path, task.ID))
@@ -325,7 +1423,8 @@ index 000000000..8a61535b3
 +	}
 +	c.JSON(http.StatusOK, backgroundResponsePendingPayload(task))
 +
-+	go h.run(task.ID, taskCtx, recorder, cancel, apiKey.UserID, opts)
++	owner := service.BackgroundResponseOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}
++	go h.run(task.ID, taskCtx, recorder, cancel, owner, opts)
 +}
 +
 +func (h *BackgroundResponseHandler) Get(c *gin.Context) {
@@ -333,6 +1432,7 @@ index 000000000..8a61535b3
 +		backgroundResponseError(c, service.ErrBackgroundResponseUnavailable)
 +		return
 +	}
++	recordResponsesIngressOnce(c, nil, "background_poll")
 +	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
 +	if !ok || apiKey == nil || apiKey.UserID <= 0 || apiKey.ID <= 0 {
 +		backgroundResponseJSONError(c, http.StatusUnauthorized, "authentication_error", "Invalid API key")
@@ -349,6 +1449,10 @@ index 000000000..8a61535b3
 +		c.JSON(http.StatusOK, backgroundResponsePendingPayload(task))
 +		return
 +	}
++	if task.Status == service.BackgroundResponseStatusCancelled {
++		c.JSON(http.StatusOK, backgroundResponseCancelledPayload(task))
++		return
++	}
 +	if task.Status == service.BackgroundResponseStatusCompleted && len(task.Result) > 0 && json.Valid(task.Result) {
 +		result := task.Result
 +		result, _ = sjson.SetBytes(result, "id", task.ID)
@@ -359,6 +1463,78 @@ index 000000000..8a61535b3
 +	c.JSON(http.StatusOK, backgroundResponseFailedPayload(task))
 +}
 +
++func (h *BackgroundResponseHandler) Cancel(c *gin.Context) {
++	if h == nil || h.tasks == nil || !h.tasks.Enabled() {
++		backgroundResponseError(c, service.ErrBackgroundResponseUnavailable)
++		return
++	}
++	recordResponsesIngressOnce(c, nil, "background_cancel")
++	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
++	if !ok || apiKey == nil || apiKey.UserID <= 0 || apiKey.ID <= 0 {
++		backgroundResponseJSONError(c, http.StatusUnauthorized, "authentication_error", "Invalid API key")
++		return
++	}
++	responseID := strings.TrimSpace(c.Param("response_id"))
++	if responseID == "" {
++		responseID, _ = backgroundResponseCancelIDFromPath(c)
++	}
++	if cancelAny, ok := h.running.Load(responseID); ok {
++		if cancel, ok := cancelAny.(context.CancelFunc); ok && cancel != nil {
++			cancel()
++		}
++	}
++	task, err := h.tasks.Cancel(c.Request.Context(), service.BackgroundResponseOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}, responseID)
++	if err != nil {
++		backgroundResponseError(c, err)
++		return
++	}
++	c.Header("Cache-Control", "no-store")
++	if task.Status == service.BackgroundResponseStatusCompleted && len(task.Result) > 0 && json.Valid(task.Result) {
++		result := task.Result
++		result, _ = sjson.SetBytes(result, "id", task.ID)
++		result, _ = sjson.SetBytes(result, "background", true)
++		c.Data(http.StatusOK, "application/json; charset=utf-8", result)
++		return
++	}
++	if task.Status == service.BackgroundResponseStatusFailed {
++		c.JSON(http.StatusOK, backgroundResponseFailedPayload(task))
++		return
++	}
++	c.JSON(http.StatusOK, backgroundResponseCancelledPayload(task))
++}
++
++func (h *BackgroundResponseHandler) TryCancel(c *gin.Context) bool {
++	if h == nil || c == nil || c.Request == nil || c.Request.Method != http.MethodPost {
++		return false
++	}
++	responseID, ok := backgroundResponseCancelIDFromPath(c)
++	if !ok || responseID == "" {
++		return false
++	}
++	c.Params = append(c.Params, gin.Param{Key: "response_id", Value: responseID})
++	h.Cancel(c)
++	return true
++}
++
++func backgroundResponseCancelIDFromPath(c *gin.Context) (string, bool) {
++	if c == nil || c.Request == nil || c.Request.URL == nil {
++		return "", false
++	}
++	path := strings.Trim(strings.TrimSpace(c.Request.URL.Path), "/")
++	parts := strings.Split(path, "/")
++	for i := 0; i+2 < len(parts); i++ {
++		if parts[i] != "responses" || parts[i+2] != "cancel" {
++			continue
++		}
++		id := strings.TrimSpace(parts[i+1])
++		if id == "" || !strings.HasPrefix(id, "resp") {
++			return "", false
++		}
++		return id, true
++	}
++	return "", false
++}
++
 +func (h *BackgroundResponseHandler) executeWithGateway(c *gin.Context) {
 +	if h == nil || h.openAI == nil {
 +		backgroundResponseJSONError(c, http.StatusServiceUnavailable, "api_error", "Responses gateway is unavailable")
@@ -367,7 +1543,9 @@ index 000000000..8a61535b3
 +	h.openAI.Responses(c)
 +}
 +
-+func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, recorder *httptest.ResponseRecorder, cancel context.CancelFunc, userID int64, opts backgroundResponseSubmitOptions) {
++func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, recorder *httptest.ResponseRecorder, cancel context.CancelFunc, owner service.BackgroundResponseOwner, opts backgroundResponseSubmitOptions) {
++	h.running.Store(taskID, cancel)
++	defer h.running.Delete(taskID)
 +	defer cancel()
 +	defer func() {
 +		if recovered := recover(); recovered != nil {
@@ -376,32 +1554,51 @@ index 000000000..8a61535b3
 +		}
 +	}()
 +	if opts.heavyWebSearch {
-+		release, queueWait, err := h.acquireHeavyWebSearchQueue(taskCtx.Request.Context(), userID)
++		release, queueWait, err := h.acquireHeavyWebSearchQueue(taskCtx.Request.Context(), owner.UserID)
 +		if err != nil {
 +			logger.L().Warn("background_response.heavy_queue_acquire_failed",
 +				zap.String("response_id", taskID),
-+				zap.Int64("user_id", userID),
++				zap.Int64("user_id", owner.UserID),
 +				zap.Int64("queue_wait_ms", queueWait.Milliseconds()),
 +				zap.Error(err),
 +			)
++			if errors.Is(err, context.Canceled) {
++				h.cancelTask(taskID)
++				return
++			}
++			if errors.Is(err, errBackgroundHeavyQueueFull) {
++				h.failTask(taskID, http.StatusTooManyRequests, backgroundResponseErrorPayload("proxy_heavy_queue_full", "heavy web search queue is full"))
++				return
++			}
 +			h.failTask(taskID, http.StatusServiceUnavailable, backgroundResponseErrorPayload("proxy_heavy_queue_timeout", "heavy web search queue timed out before execution"))
 +			return
 +		}
 +		defer release()
-+		taskCtx.Set(backgroundResponseUserSlotWaitTimeoutKey, h.tasks.ExecutionTimeout())
++		taskCtx.Set(responsesSkipUserSlotKey, true)
++		taskCtx.Set(responsesHeavySlotAlreadyAcquiredKey, true)
 +		logger.L().Info("background_response.heavy_queue_acquired",
 +			zap.String("response_id", taskID),
-+			zap.Int64("user_id", userID),
++			zap.Int64("user_id", owner.UserID),
 +			zap.Int64("queue_wait_ms", queueWait.Milliseconds()),
 +		)
++	}
++	if h.isTaskCancelled(taskID, owner) {
++		return
 +	}
 +	if err := h.tasks.MarkInProgress(context.Background(), taskID); err != nil {
 +		logger.L().Error("background_response.mark_processing_failed", zap.String("response_id", taskID), zap.Error(err))
 +	}
++	if h.isTaskCancelled(taskID, owner) {
++		return
++	}
 +	h.execute(taskCtx)
 +	body := bytes.TrimSpace(recorder.Body.Bytes())
 +	if err := taskCtx.Request.Context().Err(); err != nil && len(body) == 0 {
-+		h.failTask(taskID, http.StatusGatewayTimeout, backgroundResponseErrorPayload("timeout_error", "background response timed out"))
++		if errors.Is(err, context.Canceled) {
++			h.cancelTask(taskID)
++			return
++		}
++		h.failTask(taskID, http.StatusGatewayTimeout, backgroundResponseErrorPayload("upstream_timeout", "background response timed out"))
 +		return
 +	}
 +	statusCode := recorder.Code
@@ -428,13 +1625,36 @@ index 000000000..8a61535b3
 +		}
 +		return
 +	}
-+	h.failTask(taskID, statusCode, extractBackgroundResponseError(body))
++	h.failTask(taskID, statusCode, classifyBackgroundResponseFailure(statusCode, body, extractBackgroundResponseError(body)))
 +}
 +
 +func (h *BackgroundResponseHandler) failTask(taskID string, statusCode int, taskErr json.RawMessage) {
 +	if err := h.tasks.Fail(context.Background(), taskID, statusCode, taskErr); err != nil {
 +		logger.L().Error("background_response.failure_store_failed", zap.String("response_id", taskID), zap.Error(err))
 +	}
++}
++
++func (h *BackgroundResponseHandler) cancelTask(taskID string) {
++	if h == nil || h.tasks == nil {
++		return
++	}
++	if err := h.tasks.CancelByID(context.Background(), taskID); err == nil {
++		return
++	}
++	// Cancel requires owner for API calls. For internal cancellation we only have
++	// the id in some late failure paths; keep terminal cancellation best-effort by
++	// failing with an explicit type if ownership lookup is unavailable.
++	if failErr := h.tasks.Fail(context.Background(), taskID, statusClientClosedRequest, backgroundResponseErrorPayload("downstream_client_cancelled", "background response cancelled")); failErr != nil {
++		logger.L().Error("background_response.cancel_store_failed", zap.String("response_id", taskID), zap.Error(failErr))
++	}
++}
++
++func (h *BackgroundResponseHandler) isTaskCancelled(taskID string, owner service.BackgroundResponseOwner) bool {
++	if h == nil || h.tasks == nil || !h.tasks.Enabled() {
++		return false
++	}
++	task, err := h.tasks.Get(context.Background(), owner, taskID)
++	return err == nil && task.Status == service.BackgroundResponseStatusCancelled
 +}
 +
 +func normalizeBackgroundResponseExecutionBody(body []byte) ([]byte, error) {
@@ -597,6 +1817,21 @@ index 000000000..8a61535b3
 +	}
 +}
 +
++func backgroundResponseCancelledPayload(task *service.BackgroundResponseTaskRecord) gin.H {
++	return gin.H{
++		"id":                 task.ID,
++		"object":             "response",
++		"created_at":         task.CreatedAt,
++		"status":             service.BackgroundResponseStatusCancelled,
++		"background":         true,
++		"model":              task.Model,
++		"output":             []any{},
++		"error":              nil,
++		"incomplete_details": nil,
++		"usage":              nil,
++	}
++}
++
 +func extractBackgroundResponseError(body []byte) json.RawMessage {
 +	if json.Valid(body) {
 +		var envelope struct {
@@ -608,6 +1843,33 @@ index 000000000..8a61535b3
 +		return json.RawMessage(body)
 +	}
 +	return backgroundResponseErrorPayload("api_error", "background response failed")
++}
++
++func classifyBackgroundResponseFailure(statusCode int, body []byte, taskErr json.RawMessage) json.RawMessage {
++	bodyText := strings.ToLower(string(body))
++	errText := strings.ToLower(string(taskErr))
++	switch {
++	case statusCode == http.StatusTooManyRequests:
++		return backgroundResponseErrorPayload("upstream_rate_limited", backgroundResponseErrorMessage(taskErr, "upstream rate limited"))
++	case strings.Contains(bodyText, "unexpected eof") || strings.Contains(errText, "unexpected eof"):
++		return backgroundResponseErrorPayload("upstream_unexpected_eof", backgroundResponseErrorMessage(taskErr, "upstream connection closed unexpectedly"))
++	case statusCode == http.StatusGatewayTimeout || strings.Contains(errText, "timeout"):
++		return backgroundResponseErrorPayload("upstream_timeout", backgroundResponseErrorMessage(taskErr, "upstream request timed out"))
++	default:
++		return taskErr
++	}
++}
++
++func backgroundResponseErrorMessage(taskErr json.RawMessage, fallback string) string {
++	if len(taskErr) > 0 && json.Valid(taskErr) {
++		if msg := strings.TrimSpace(gjson.GetBytes(taskErr, "message").String()); msg != "" {
++			return msg
++		}
++		if msg := strings.TrimSpace(gjson.GetBytes(taskErr, "error.message").String()); msg != "" {
++			return msg
++		}
++	}
++	return fallback
 +}
 +
 +func backgroundResponseErrorPayload(errorType, message string) json.RawMessage {
@@ -1000,10 +2262,10 @@ index 000000000..8a61535b3
 +}
 diff --git a/backend/internal/handler/background_response_handler_test.go b/backend/internal/handler/background_response_handler_test.go
 new file mode 100644
-index 000000000..2ead579f8
+index 00000000..9467c509
 --- /dev/null
 +++ b/backend/internal/handler/background_response_handler_test.go
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,613 @@
 +package handler
 +
 +import (
@@ -1022,6 +2284,7 @@ index 000000000..2ead579f8
 +	"github.com/gin-gonic/gin"
 +	"github.com/stretchr/testify/require"
 +	"github.com/tidwall/gjson"
++	"go.uber.org/zap"
 +)
 +
 +type backgroundResponseHandlerMemoryStore struct {
@@ -1050,6 +2313,25 @@ index 000000000..2ead579f8
 +	copy.Result = append(json.RawMessage(nil), task.Result...)
 +	copy.Error = append(json.RawMessage(nil), task.Error...)
 +	return &copy, nil
++}
++
++func (s *backgroundResponseHandlerMemoryStore) ListActive(_ context.Context, limit int) ([]*service.BackgroundResponseTaskRecord, error) {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	var out []*service.BackgroundResponseTaskRecord
++	for _, task := range s.tasks {
++		if task.Status != service.BackgroundResponseStatusQueued && task.Status != service.BackgroundResponseStatusInProgress {
++			continue
++		}
++		copy := *task
++		copy.Result = append(json.RawMessage(nil), task.Result...)
++		copy.Error = append(json.RawMessage(nil), task.Error...)
++		out = append(out, &copy)
++		if limit > 0 && len(out) >= limit {
++			break
++		}
++	}
++	return out, nil
 +}
 +
 +func TestBackgroundResponseSubmitSurvivesDisconnectAndPollsFinalResult(t *testing.T) {
@@ -1211,6 +2493,70 @@ index 000000000..2ead579f8
 +	require.Equal(t, original, w.Body.String())
 +}
 +
++func TestBackgroundResponseTrySubmitDoesNotDetachSynchronousHeavyRequest(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	h := &BackgroundResponseHandler{tasks: service.NewBackgroundResponseTaskService(&backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)})}
++	router := gin.New()
++	router.POST("/v1/responses", func(c *gin.Context) {
++		require.False(t, h.TrySubmit(c))
++		body, err := io.ReadAll(c.Request.Body)
++		require.NoError(t, err)
++		c.Data(http.StatusOK, "application/json", body)
++	})
++
++	original := heavyWebSearchRequestBody(false)
++	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(original))
++	w := httptest.NewRecorder()
++	router.ServeHTTP(w, req)
++	require.Equal(t, http.StatusOK, w.Code)
++	require.JSONEq(t, original, w.Body.String())
++}
++
++func TestBackgroundResponseCancelQueuedTask(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
++	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
++	block := make(chan struct{})
++	started := make(chan struct{}, 1)
++	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue()}
++	h.execute = func(c *gin.Context) {
++		started <- struct{}{}
++		<-block
++		c.JSON(http.StatusOK, gin.H{"id": "resp_upstream", "object": "response", "status": service.BackgroundResponseStatusCompleted, "output": []gin.H{}})
++	}
++
++	router := gin.New()
++	router.Use(func(c *gin.Context) {
++		c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{ID: 9, UserID: 7})
++		c.Next()
++	})
++	router.POST("/v1/responses", func(c *gin.Context) { require.True(t, h.TrySubmit(c)) })
++	router.POST("/v1/responses/*subpath", func(c *gin.Context) { require.True(t, h.TryCancel(c)) })
++	router.GET("/v1/responses/:response_id", h.Get)
++
++	firstID := submitHeavyBackgroundForTest(t, router)
++	select {
++	case <-started:
++	case <-time.After(time.Second):
++		t.Fatal("first heavy background request did not start")
++	}
++	secondID := submitHeavyBackgroundForTest(t, router)
++	require.NotEmpty(t, firstID)
++	require.NotEmpty(t, secondID)
++
++	cancelReq := httptest.NewRequest(http.MethodPost, "/v1/responses/"+secondID+"/cancel", nil)
++	cancelWriter := httptest.NewRecorder()
++	router.ServeHTTP(cancelWriter, cancelReq)
++	require.Equal(t, http.StatusOK, cancelWriter.Code)
++	require.Contains(t, cancelWriter.Body.String(), `"status":"cancelled"`)
++
++	close(block)
++	require.Eventually(t, func() bool {
++		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, secondID)
++		return err == nil && got.Status == service.BackgroundResponseStatusCancelled
++	}, time.Second, 10*time.Millisecond)
++}
++
 +func TestBackgroundResponseRejectsStoreFalse(t *testing.T) {
 +	gin.SetMode(gin.TestMode)
 +	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
@@ -1230,7 +2576,7 @@ index 000000000..2ead579f8
 +	require.Empty(t, store.tasks)
 +}
 +
-+func TestBackgroundResponseAutoSubmitsHeavyWebSearchRequest(t *testing.T) {
++func TestBackgroundResponseSubmitHeavyWebSearchBackgroundRequest(t *testing.T) {
 +	gin.SetMode(gin.TestMode)
 +	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
 +	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
@@ -1270,11 +2616,11 @@ index 000000000..2ead579f8
 +	})
 +	router.POST("/v1/responses", func(c *gin.Context) { require.True(t, h.TrySubmit(c)) })
 +
-+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchRequestBody(false)))
++	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchBackgroundRequestBody()))
 +	w := httptest.NewRecorder()
 +	router.ServeHTTP(w, req)
 +	require.Equal(t, http.StatusOK, w.Code)
-+	require.Equal(t, "true", w.Header().Get("X-SubtoProxy-Auto-Background"))
++	require.Empty(t, w.Header().Get("X-SubtoProxy-Auto-Background"))
 +	require.Equal(t, "heavy_web_search", w.Header().Get("X-SubtoProxy-Background-Queue"))
 +	require.Equal(t, "3", w.Header().Get("Retry-After"))
 +
@@ -1382,13 +2728,118 @@ index 000000000..2ead579f8
 +	}, time.Second, 10*time.Millisecond)
 +}
 +
++func TestBackgroundResponseHeavyQueueFullAndCancel(t *testing.T) {
++	q := newBackgroundResponseHeavyQueueWithOptions(1, 1, 1)
++	firstRelease, _, err := q.acquire(context.Background(), 7)
++	require.NoError(t, err)
++	defer firstRelease()
++
++	secondCtx, secondCancel := context.WithCancel(context.Background())
++	secondDone := make(chan error, 1)
++	go func() {
++		release, _, acquireErr := q.acquire(secondCtx, 7)
++		if release != nil {
++			release()
++		}
++		secondDone <- acquireErr
++	}()
++	require.Eventually(t, func() bool { return q.waitingCount() == 1 }, time.Second, 10*time.Millisecond)
++
++	_, _, err = q.acquire(context.Background(), 7)
++	require.ErrorIs(t, err, errBackgroundHeavyQueueFull)
++
++	secondCancel()
++	require.ErrorIs(t, <-secondDone, context.Canceled)
++	require.Eventually(t, func() bool { return q.waitingCount() == 0 }, time.Second, 10*time.Millisecond)
++}
++
++func TestResponsesHeavySchedulerCancelsAndSkipsUserSlot(t *testing.T) {
++	oldQueue := defaultBackgroundResponseHeavyQueue
++	defaultBackgroundResponseHeavyQueue = newBackgroundResponseHeavyQueueWithOptions(1, 1, 4)
++	defer func() { defaultBackgroundResponseHeavyQueue = oldQueue }()
++
++	gin.SetMode(gin.TestMode)
++	requestCtx, cancel := context.WithCancel(context.Background())
++	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchRequestBody(false))).WithContext(requestCtx)
++	w := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(w)
++	c.Request = req
++
++	h := &OpenAIGatewayHandler{}
++	release, ok := h.acquireResponsesHeavyWebSearchSlot(c, []byte(heavyWebSearchRequestBody(false)), 7, 9, zap.NewNop())
++	require.True(t, ok)
++	require.NotNil(t, release)
++	skip, _ := c.Get(responsesSkipUserSlotKey)
++	require.True(t, skip.(bool))
++
++	streamStarted := false
++	userRelease, acquired := h.acquireResponsesUserSlot(c, 7, 1, false, &streamStarted, zap.NewNop())
++	require.True(t, acquired)
++	require.Nil(t, userRelease)
++
++	cancel()
++	require.Eventually(t, func() bool {
++		nextRelease, _, err := defaultBackgroundResponseHeavyQueue.acquire(context.Background(), 7)
++		if err != nil {
++			return false
++		}
++		nextRelease()
++		return true
++	}, time.Second, 10*time.Millisecond)
++	release()
++	require.Equal(t, int64(0), responsesOrphanActiveTasksForTest())
++}
++
++func TestResponsesIngressCountsEntryPollAndCancelSeparately(t *testing.T) {
++	resetResponsesIngressMetricsForTest()
++	gin.SetMode(gin.TestMode)
++	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
++	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
++	h := &BackgroundResponseHandler{tasks: tasks}
++	h.execute = func(c *gin.Context) {
++		c.JSON(http.StatusOK, gin.H{"id": "resp_upstream", "object": "response", "status": service.BackgroundResponseStatusCompleted, "output": []gin.H{}})
++	}
++	router := gin.New()
++	router.Use(func(c *gin.Context) {
++		c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{ID: 9, UserID: 7})
++		c.Next()
++	})
++	router.POST("/v1/responses", func(c *gin.Context) { require.True(t, h.TrySubmit(c)) })
++	router.POST("/v1/responses/*subpath", func(c *gin.Context) { require.True(t, h.TryCancel(c)) })
++	router.GET("/v1/responses/:response_id", h.Get)
++
++	id := submitHeavyBackgroundForTest(t, router)
++	pollReq := httptest.NewRequest(http.MethodGet, "/v1/responses/"+id, nil)
++	pollWriter := httptest.NewRecorder()
++	router.ServeHTTP(pollWriter, pollReq)
++	require.Equal(t, http.StatusOK, pollWriter.Code)
++
++	cancelReq := httptest.NewRequest(http.MethodPost, "/v1/responses/"+id+"/cancel", nil)
++	cancelWriter := httptest.NewRecorder()
++	router.ServeHTTP(cancelWriter, cancelReq)
++	require.Equal(t, http.StatusOK, cancelWriter.Code)
++
++	require.Equal(t, uint64(1), responsesIngressKindCountForTest("responses_post"))
++	require.Equal(t, uint64(1), responsesIngressKindCountForTest("background_poll"))
++	require.Equal(t, uint64(1), responsesIngressKindCountForTest("background_cancel"))
++	require.Equal(t, uint64(0), responsesIngressKindCountForTest("internal_background_execute"))
++}
++
++func TestBackgroundResponseFailureClassification(t *testing.T) {
++	rateLimited := classifyBackgroundResponseFailure(http.StatusTooManyRequests, []byte(`{"error":{"message":"slow down"}}`), json.RawMessage(`{"type":"rate_limit_error","message":"slow down"}`))
++	require.Equal(t, "upstream_rate_limited", gjson.GetBytes(rateLimited, "type").String())
++	require.Equal(t, "slow down", gjson.GetBytes(rateLimited, "message").String())
++
++	eof := classifyBackgroundResponseFailure(http.StatusBadGateway, []byte("unexpected EOF"), backgroundResponseErrorPayload("api_error", "unexpected EOF"))
++	require.Equal(t, "upstream_unexpected_eof", gjson.GetBytes(eof, "type").String())
++}
++
 +func submitHeavyBackgroundForTest(t *testing.T, router http.Handler) string {
 +	t.Helper()
-+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchRequestBody(false)))
++	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchBackgroundRequestBody()))
 +	w := httptest.NewRecorder()
 +	router.ServeHTTP(w, req)
 +	require.Equal(t, http.StatusOK, w.Code)
-+	require.Equal(t, "true", w.Header().Get("X-SubtoProxy-Auto-Background"))
 +	var accepted struct {
 +		ID string `json:"id"`
 +	}
@@ -1416,6 +2867,10 @@ index 000000000..2ead579f8
 +	}`
 +}
 +
++func heavyWebSearchBackgroundRequestBody() string {
++	return strings.Replace(heavyWebSearchRequestBody(true), `"store":false`, `"store":true`, 1)
++}
++
 +func jsonPathBool(body []byte, path string) bool {
 +	var value map[string]any
 +	if json.Unmarshal(body, &value) != nil {
@@ -1424,380 +2879,285 @@ index 000000000..2ead579f8
 +	result, _ := value[path].(bool)
 +	return result
 +}
-diff --git a/backend/internal/handler/gateway_helper.go b/backend/internal/handler/gateway_helper.go
-index 1f6daf529..5059f8713 100644
---- a/backend/internal/handler/gateway_helper.go
-+++ b/backend/internal/handler/gateway_helper.go
-@@ -241,7 +241,15 @@ func (h *ConcurrencyHelper) TryAcquireAccountSlot(ctx context.Context, accountID
- // For streaming requests, sends ping events during the wait.
- // streamStarted is updated if streaming response has begun.
- func (h *ConcurrencyHelper) AcquireUserSlotWithWait(c *gin.Context, userID int64, maxConcurrency int, isStream bool, streamStarted *bool) (func(), error) {
--	return h.acquireUserSlotWithWaitTimeout(c, userID, maxConcurrency, maxConcurrencyWait, isStream, streamStarted)
-+	timeout := maxConcurrencyWait
-+	if c != nil {
-+		if raw, ok := c.Get(backgroundResponseUserSlotWaitTimeoutKey); ok {
-+			if requested, ok := raw.(time.Duration); ok && requested > timeout {
-+				timeout = requested
-+			}
-+		}
-+	}
-+	return h.acquireUserSlotWithWaitTimeout(c, userID, maxConcurrency, timeout, isStream, streamStarted)
- }
- 
- func (h *ConcurrencyHelper) acquireUserSlotWithWaitTimeout(c *gin.Context, userID int64, maxConcurrency int, timeout time.Duration, isStream bool, streamStarted *bool) (func(), error) {
-diff --git a/backend/internal/handler/handler.go b/backend/internal/handler/handler.go
-index 13d3076b5..9a2a7e294 100644
---- a/backend/internal/handler/handler.go
-+++ b/backend/internal/handler/handler.go
-@@ -45,24 +45,25 @@ type AdminHandlers struct {
- 
- // Handlers contains all HTTP handlers
- type Handlers struct {
--	Auth             *AuthHandler
--	User             *UserHandler
--	APIKey           *APIKeyHandler
--	Usage            *UsageHandler
--	Redeem           *RedeemHandler
--	Subscription     *SubscriptionHandler
--	Announcement     *AnnouncementHandler
--	ChannelMonitor   *ChannelMonitorUserHandler
--	Admin            *AdminHandlers
--	Gateway          *GatewayHandler
--	OpenAIGateway    *OpenAIGatewayHandler
--	Setting          *SettingHandler
--	Totp             *TotpHandler
--	Payment          *PaymentHandler
--	PaymentWebhook   *PaymentWebhookHandler
--	AvailableChannel *AvailableChannelHandler
--	AsyncImage       *AsyncImageHandler
--	BatchImage       *BatchImageHandler
-+	Auth               *AuthHandler
-+	User               *UserHandler
-+	APIKey             *APIKeyHandler
-+	Usage              *UsageHandler
-+	Redeem             *RedeemHandler
-+	Subscription       *SubscriptionHandler
-+	Announcement       *AnnouncementHandler
-+	ChannelMonitor     *ChannelMonitorUserHandler
-+	Admin              *AdminHandlers
-+	Gateway            *GatewayHandler
-+	OpenAIGateway      *OpenAIGatewayHandler
-+	Setting            *SettingHandler
-+	Totp               *TotpHandler
-+	Payment            *PaymentHandler
-+	PaymentWebhook     *PaymentWebhookHandler
-+	AvailableChannel   *AvailableChannelHandler
-+	AsyncImage         *AsyncImageHandler
-+	BackgroundResponse *BackgroundResponseHandler
-+	BatchImage         *BatchImageHandler
- }
- 
- // BuildInfo contains build-time information
-diff --git a/backend/internal/handler/openai_gateway_handler.go b/backend/internal/handler/openai_gateway_handler.go
-index 7b697d6d6..f2958d839 100644
---- a/backend/internal/handler/openai_gateway_handler.go
-+++ b/backend/internal/handler/openai_gateway_handler.go
-@@ -47,7 +47,38 @@ type grokMediaEligibilityProber interface {
- 	ProbeMediaEligibility(ctx context.Context, accountID int64) (bool, string, error)
- }
- 
--const maxOpenAIFirstOutputTimeoutSwitches = 1
-+const (
-+	maxOpenAIFirstOutputTimeoutSwitches = 1
+diff --git a/backend/internal/handler/responses_heavy_scheduler.go b/backend/internal/handler/responses_heavy_scheduler.go
+new file mode 100644
+index 00000000..d223caf9
+--- /dev/null
++++ b/backend/internal/handler/responses_heavy_scheduler.go
+@@ -0,0 +1,68 @@
++package handler
 +
-+	openAIRateLimitLayerContextKey      = "openai_rate_limit_layer"
-+	openAIRateLimitUpstreamRequestIDKey = "openai_rate_limit_upstream_request_id"
-+	openAIRateLimitUpstreamStatusKey    = "openai_rate_limit_upstream_status"
-+	openAIRateLimitLayerHeader          = "X-RateLimit-Layer"
-+	openAIUpstreamStatusCodeHeader      = "X-Upstream-Status-Code"
-+	openAIUpstreamRequestIDHeader       = "X-Upstream-Request-ID"
++import (
++	"context"
++	"errors"
++	"net/http"
++
++	"github.com/gin-gonic/gin"
++	"go.uber.org/zap"
 +)
 +
-+func markOpenAIRateLimitLayer(c *gin.Context, layer string, upstreamStatus int, upstreamRequestID string) {
++func (h *OpenAIGatewayHandler) acquireResponsesHeavyWebSearchSlot(
++	c *gin.Context,
++	body []byte,
++	userID int64,
++	apiKeyID int64,
++	reqLog *zap.Logger,
++) (func(), bool) {
++	if c == nil {
++		return nil, true
++	}
++	if acquired, _ := c.Get(responsesHeavySlotAlreadyAcquiredKey); acquired == true {
++		return nil, true
++	}
++	if !backgroundResponseIsHeavyWebSearch(body) {
++		return nil, true
++	}
++
++	release, queueWait, err := defaultBackgroundResponseHeavyQueue.acquire(c.Request.Context(), userID)
++	if err != nil {
++		fields := []zap.Field{
++			zap.Int64("user_id", userID),
++			zap.Int64("api_key_id", apiKeyID),
++			zap.Int64("queue_wait_ms", queueWait.Milliseconds()),
++			zap.Int("queue_waiting", defaultBackgroundResponseHeavyQueue.waitingCount()),
++			zap.Error(err),
++		}
++		if reqLog != nil {
++			reqLog.Warn("openai.responses_heavy_queue_acquire_failed", fields...)
++		}
++		switch {
++		case errors.Is(err, errBackgroundHeavyQueueFull):
++			c.Header("Retry-After", "3")
++			markOpenAIRateLimitLayer(c, "proxy_heavy_queue", http.StatusTooManyRequests, "")
++			h.handleStreamingAwareError(c, http.StatusTooManyRequests, "proxy_heavy_queue_full", "heavy web search queue is full, please retry later", false)
++		case errors.Is(err, context.Canceled):
++			h.handleStreamingAwareError(c, statusClientClosedRequest, "downstream_client_cancelled", "client disconnected before heavy web search could start", false)
++		default:
++			c.Header("Retry-After", "3")
++			markOpenAIRateLimitLayer(c, "proxy_heavy_queue", http.StatusTooManyRequests, "")
++			h.handleStreamingAwareError(c, http.StatusTooManyRequests, "proxy_user_concurrency_timeout", "timeout waiting for heavy web search queue", false)
++		}
++		return nil, false
++	}
++	c.Set(responsesSkipUserSlotKey, true)
++	c.Set(responsesHeavySlotAlreadyAcquiredKey, true)
++	recordResponsesLifecycle(c, body, "heavy_queue_acquired",
++		zap.Int64("user_id", userID),
++		zap.Int64("api_key_id", apiKeyID),
++		zap.Int64("queue_wait_ms", queueWait.Milliseconds()),
++		zap.Int("queue_waiting", defaultBackgroundResponseHeavyQueue.waitingCount()),
++	)
++	stopOrphanMonitor := startResponsesOrphanMonitor(c, "sync_heavy_web_search")
++	return wrapReleaseOnDone(c.Request.Context(), func() {
++		stopOrphanMonitor()
++		release()
++	}), true
++}
+diff --git a/backend/internal/handler/responses_ingress_metrics.go b/backend/internal/handler/responses_ingress_metrics.go
+new file mode 100644
+index 00000000..42d80888
+--- /dev/null
++++ b/backend/internal/handler/responses_ingress_metrics.go
+@@ -0,0 +1,136 @@
++package handler
++
++import (
++	"strings"
++	"sync"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
++	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
++	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/gin-gonic/gin"
++	"github.com/tidwall/gjson"
++	"go.uber.org/zap"
++)
++
++const (
++	responsesIngressRecordedKey           = "subtoproxy_responses_ingress_recorded"
++	responsesInternalBackgroundExecuteKey = "subtoproxy_responses_internal_background_execute"
++)
++
++type responsesIngressMetricKey struct {
++	Kind            string
++	UserID          int64
++	APIKeyID        int64
++	Model           string
++	SourceIP        string
++	ClientRequestID string
++	ProxyRequestID  string
++}
++
++var responsesIngressMetrics = struct {
++	mu     sync.Mutex
++	total  map[string]uint64
++	byDims map[responsesIngressMetricKey]uint64
++}{
++	total:  make(map[string]uint64),
++	byDims: make(map[responsesIngressMetricKey]uint64),
++}
++
++func recordResponsesIngressOnce(c *gin.Context, body []byte, kind string) {
 +	if c == nil {
 +		return
 +	}
-+	layer = strings.TrimSpace(layer)
-+	if layer == "" {
++	if internal, _ := c.Get(responsesInternalBackgroundExecuteKey); internal == true {
++		recordResponsesLifecycle(c, body, "internal_background_execute")
 +		return
 +	}
-+	c.Set(openAIRateLimitLayerContextKey, layer)
-+	c.Header(openAIRateLimitLayerHeader, layer)
-+	if upstreamStatus > 0 {
-+		status := strconv.Itoa(upstreamStatus)
-+		c.Set(openAIRateLimitUpstreamStatusKey, status)
-+		c.Header(openAIUpstreamStatusCodeHeader, status)
++	if recorded, _ := c.Get(responsesIngressRecordedKey); recorded == true {
++		return
 +	}
-+	upstreamRequestID = strings.TrimSpace(upstreamRequestID)
-+	if upstreamRequestID != "" && !strings.ContainsAny(upstreamRequestID, "\r\n") && len(upstreamRequestID) <= 128 {
-+		c.Set(openAIRateLimitUpstreamRequestIDKey, upstreamRequestID)
-+		c.Header(openAIUpstreamRequestIDHeader, upstreamRequestID)
++	c.Set(responsesIngressRecordedKey, true)
++	recordResponsesIngress(c, body, strings.TrimSpace(kind))
++}
++
++func recordResponsesIngress(c *gin.Context, body []byte, kind string) {
++	if kind == "" {
++		kind = "responses_http"
++	}
++	dims := responsesIngressDimensions(c, body, kind)
++	responsesIngressMetrics.mu.Lock()
++	responsesIngressMetrics.total[kind]++
++	responsesIngressMetrics.byDims[dims]++
++	total := responsesIngressMetrics.total[kind]
++	dimTotal := responsesIngressMetrics.byDims[dims]
++	responsesIngressMetrics.mu.Unlock()
++
++	log := requestLogger(c, "handler.openai_gateway.responses_ingress")
++	log.Info("ingress_request_total",
++		zap.String("kind", kind),
++		zap.Uint64("total", total),
++		zap.Uint64("dimension_total", dimTotal),
++		zap.Int64("user_id", dims.UserID),
++		zap.Int64("api_key_id", dims.APIKeyID),
++		zap.String("model", dims.Model),
++		zap.String("source_ip", dims.SourceIP),
++		zap.String("client_request_id", dims.ClientRequestID),
++		zap.String("proxy_request_id", dims.ProxyRequestID),
++		zap.Bool("has_web_search", service.OpenAIResponsesNativeContract(body).HasHostedWebSearch),
++		zap.Bool("heavy_web_search", backgroundResponseIsHeavyWebSearch(body)),
++	)
++}
++
++func recordResponsesLifecycle(c *gin.Context, body []byte, kind string, fields ...zap.Field) {
++	kind = strings.TrimSpace(kind)
++	if kind == "" {
++		kind = "lifecycle"
++	}
++	dims := responsesIngressDimensions(c, body, kind)
++	logFields := []zap.Field{
++		zap.String("kind", kind),
++		zap.Int64("user_id", dims.UserID),
++		zap.Int64("api_key_id", dims.APIKeyID),
++		zap.String("model", dims.Model),
++		zap.String("source_ip", dims.SourceIP),
++		zap.String("client_request_id", dims.ClientRequestID),
++		zap.String("proxy_request_id", dims.ProxyRequestID),
++	}
++	logFields = append(logFields, fields...)
++	requestLogger(c, "handler.openai_gateway.responses_lifecycle").Info("responses_lifecycle_event", logFields...)
++}
++
++func responsesIngressDimensions(c *gin.Context, body []byte, kind string) responsesIngressMetricKey {
++	var userID, apiKeyID int64
++	if apiKey, ok := middleware2.GetAPIKeyFromContext(c); ok && apiKey != nil {
++		userID = apiKey.UserID
++		apiKeyID = apiKey.ID
++	}
++	if subject, ok := middleware2.GetAuthSubjectFromContext(c); ok && subject.UserID > 0 {
++		userID = subject.UserID
++	}
++	clientRequestID, _ := c.Request.Context().Value(ctxkey.ClientRequestID).(string)
++	proxyRequestID, _ := c.Request.Context().Value(ctxkey.RequestID).(string)
++	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
++	return responsesIngressMetricKey{
++		Kind:            kind,
++		UserID:          userID,
++		APIKeyID:        apiKeyID,
++		Model:           model,
++		SourceIP:        ip.GetClientIP(c),
++		ClientRequestID: strings.TrimSpace(clientRequestID),
++		ProxyRequestID:  strings.TrimSpace(proxyRequestID),
 +	}
 +}
- 
- func openAIForwardSucceededForScheduling(result *service.OpenAIForwardResult) bool {
- 	return result.SucceededForScheduling()
-@@ -259,7 +290,25 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
- 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
- 		return
- 	}
--	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
-+	nativeContract := service.OpenAIResponsesNativeContract(body)
-+	if nativeContract.RequiresNativeResponses {
-+		c.Set("openai_responses_requires_native", true)
++
++func resetResponsesIngressMetricsForTest() {
++	responsesIngressMetrics.mu.Lock()
++	defer responsesIngressMetrics.mu.Unlock()
++	responsesIngressMetrics.total = make(map[string]uint64)
++	responsesIngressMetrics.byDims = make(map[responsesIngressMetricKey]uint64)
++}
++
++func responsesIngressKindCountForTest(kind string) uint64 {
++	responsesIngressMetrics.mu.Lock()
++	defer responsesIngressMetrics.mu.Unlock()
++	return responsesIngressMetrics.total[strings.TrimSpace(kind)]
++}
+diff --git a/backend/internal/handler/responses_orphan_metrics.go b/backend/internal/handler/responses_orphan_metrics.go
+new file mode 100644
+index 00000000..4ba03490
+--- /dev/null
++++ b/backend/internal/handler/responses_orphan_metrics.go
+@@ -0,0 +1,51 @@
++package handler
++
++import (
++	"context"
++	"sync/atomic"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"go.uber.org/zap"
++)
++
++var responsesOrphanActiveTasks atomic.Int64
++
++func startResponsesOrphanMonitor(c *gin.Context, kind string) func() {
++	if c == nil || c.Request == nil {
++		return func() {}
 +	}
-+	if nativeContract.HasHostedWebSearch {
-+		c.Set("openai_responses_has_web_search", true)
-+	}
-+	if nativeContract.RequestsWebSearchSources {
-+		c.Set("openai_responses_include_web_search_sources", true)
-+	}
-+	reqLog = reqLog.With(
-+		zap.String("model", reqModel),
-+		zap.Bool("stream", reqStream),
-+		zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
-+		zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
-+		zap.Bool("requires_native_responses", nativeContract.RequiresNativeResponses),
-+		zap.Bool("background", nativeContract.Background),
-+		zap.String("tool_choice", nativeContract.ToolChoice),
-+	)
- 	previousResponseID := strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
- 	if previousResponseID != "" {
- 		previousResponseIDKind := service.ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
-@@ -314,6 +363,15 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
- 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
- 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)
- 	seedOpenAIForwardImageIntentHint(c, channelMapping.Mapped, imageIntent)
-+	if channelMapping.Mapped {
-+		reqLog = reqLog.With(
-+			zap.Bool("model_mapping_applied", true),
-+			zap.String("mapped_model", channelMapping.MappedModel),
-+		)
-+		c.Set("openai_mapped_model", channelMapping.MappedModel)
-+	} else {
-+		reqLog = reqLog.With(zap.Bool("model_mapping_applied", false))
-+	}
- 
- 	// 提前校验 function_call_output 是否具备可关联上下文，避免上游 400。
- 	if !h.validateFunctionCallOutputRequest(c, body, reqLog) {
-@@ -371,8 +429,14 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
- 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
- 	// 仅对 OpenAI 平台生效：Grok 生图走独立的 forwardGrokResponses 路径，不应被过滤。
- 	// 复用前置权限与并发阶段在未修改 body 上确认的显式生图意图，避免大 tools 请求重复扫描。
--	// 该判断已排除 Codex 被动 image_gen namespace，避免 CC-only 账号被误过滤（#4476）。
-+	// native Responses 合同（例如 web_search_call.action.sources）同样必须路由到 Responses 能力账号，不能降级到 Chat Completions。
- 	requiredCapability := openAIResponsesRequiredCapability(imageIntent, requestPlatform)
-+	if requestPlatform == service.PlatformOpenAI && nativeContract.RequiresNativeResponses {
-+		requiredCapability = service.OpenAIEndpointCapabilityResponses
-+	}
-+	reqLog.Debug("openai.responses_request_features",
-+		zap.String("required_capability", string(requiredCapability)),
-+	)
- 
- 	for {
- 		// Streaming Forward intentionally detaches the upstream request so usage can
-@@ -860,7 +924,25 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
- 	preferredMappedModel := resolveOpenAIMessagesDispatchMappedModel(apiKey, reqModel)
- 	reqStream := gjson.GetBytes(body, "stream").Bool()
- 
--	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
-+	nativeContract := service.OpenAIResponsesNativeContract(body)
-+	if nativeContract.RequiresNativeResponses {
-+		c.Set("openai_responses_requires_native", true)
-+	}
-+	if nativeContract.HasHostedWebSearch {
-+		c.Set("openai_responses_has_web_search", true)
-+	}
-+	if nativeContract.RequestsWebSearchSources {
-+		c.Set("openai_responses_include_web_search_sources", true)
-+	}
-+	reqLog = reqLog.With(
-+		zap.String("model", reqModel),
-+		zap.Bool("stream", reqStream),
-+		zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
-+		zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
-+		zap.Bool("requires_native_responses", nativeContract.RequiresNativeResponses),
-+		zap.Bool("background", nativeContract.Background),
-+		zap.String("tool_choice", nativeContract.ToolChoice),
-+	)
- 
- 	setOpsRequestContext(c, reqModel, reqStream)
- 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
-@@ -1321,6 +1403,7 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
- 			zap.Int64("account_id", account.ID),
- 			zap.Int("max_waiting", selection.WaitPlan.MaxWaiting),
- 		)
-+		markOpenAIRateLimitLayer(c, "proxy_queue", http.StatusTooManyRequests, "")
- 		h.handleStreamingAwareError(c, http.StatusTooManyRequests, "rate_limit_error", "Too many pending requests, please retry later", *streamStarted)
- 		return nil, false
- 	}
-@@ -1334,6 +1417,7 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
- 	}
- 	defer releaseWait()
- 
-+	queueWaitStart := time.Now()
- 	accountReleaseFunc, err := h.concurrencyHelper.AcquireAccountSlotWithWaitTimeout(
- 		c,
- 		account.ID,
-@@ -1343,10 +1427,19 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
- 		streamStarted,
- 	)
- 	if err != nil {
--		reqLog.Warn("openai.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
-+		reqLog.Warn("openai.account_slot_acquire_failed",
-+			zap.Int64("account_id", account.ID),
-+			zap.Int64("queue_wait_ms", time.Since(queueWaitStart).Milliseconds()),
-+			zap.Error(err),
-+		)
- 		h.handleConcurrencyError(c, err, "account", *streamStarted)
- 		return nil, false
- 	}
-+	reqLog.Debug("openai.account_slot_acquired_after_wait",
-+		zap.Int64("account_id", account.ID),
-+		zap.Int64("queue_wait_ms", time.Since(queueWaitStart).Milliseconds()),
-+		zap.Int("max_concurrency", selection.WaitPlan.MaxConcurrency),
-+	)
- 
- 	// Slot acquired: no longer waiting in queue.
- 	releaseWait()
-@@ -2113,6 +2206,9 @@ func (h *OpenAIGatewayHandler) acquireImageGenerationSlot(c *gin.Context, stream
- // handleConcurrencyError handles concurrency-related acquire errors.
- func (h *OpenAIGatewayHandler) handleConcurrencyError(c *gin.Context, err error, slotType string, streamStarted bool) {
- 	status, errType, message := concurrencyErrorResponse(err, slotType)
-+	if status == http.StatusTooManyRequests {
-+		markOpenAIRateLimitLayer(c, "proxy_concurrency", status, "")
-+	}
- 	h.handleStreamingAwareError(c, status, errType, message, streamStarted)
- }
- 
-@@ -2133,6 +2229,9 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
- 		return
- 	}
- 	copyFailoverRetryAfter(c, failoverErr.ResponseHeaders)
-+	if failoverErr.StatusCode == http.StatusTooManyRequests {
-+		markOpenAIRateLimitLayer(c, "upstream", failoverErr.StatusCode, failoverErr.ResponseHeaders.Get("x-request-id"))
-+	}
- 	if failoverErr.IsCredentialFailure() {
- 		status, message := credentialFailoverClientResponse(failoverErr)
- 		h.handleStreamingAwareError(c, status, "upstream_error", message, streamStarted)
-@@ -2218,6 +2317,9 @@ func isSafeRetryAfter(value string) bool {
- func (h *OpenAIGatewayHandler) handleFailoverExhaustedSimple(c *gin.Context, statusCode int, streamStarted bool) {
- 	status, errType, errMsg := h.mapUpstreamError(statusCode)
- 	service.SetOpsUpstreamError(c, statusCode, errMsg, "")
-+	if statusCode == http.StatusTooManyRequests {
-+		markOpenAIRateLimitLayer(c, "upstream", statusCode, "")
-+	}
- 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
- }
- 
-@@ -2435,12 +2537,33 @@ func (h *OpenAIGatewayHandler) errorResponse(c *gin.Context, status int, errType
- 			return
- 		}
- 	}
--	c.JSON(status, gin.H{
--		"error": gin.H{
--			"type":    errType,
--			"message": message,
--		},
--	})
-+	errObj := gin.H{
-+		"type":    errType,
-+		"message": message,
-+	}
-+	if c != nil && c.Request != nil {
-+		if requestID, _ := c.Request.Context().Value(ctxkey.ClientRequestID).(string); strings.TrimSpace(requestID) != "" {
-+			errObj["request_id"] = strings.TrimSpace(requestID)
-+		}
-+	}
-+	if c != nil {
-+		if layer, ok := c.Get(openAIRateLimitLayerContextKey); ok {
-+			if v, ok := layer.(string); ok && strings.TrimSpace(v) != "" {
-+				errObj["rate_limit_layer"] = strings.TrimSpace(v)
++	var done atomic.Bool
++	var counted atomic.Bool
++	log := requestLogger(c, "handler.openai_gateway.responses_orphan")
++	stop := context.AfterFunc(c.Request.Context(), func() {
++		time.AfterFunc(5*time.Second, func() {
++			if done.Load() {
++				return
 +			}
++			counted.Store(true)
++			current := responsesOrphanActiveTasks.Add(1)
++			log.Warn("orphan_active_tasks",
++				zap.String("kind", kind),
++				zap.Int64("value", current),
++			)
++		})
++	})
++	return func() {
++		done.Store(true)
++		if stop != nil {
++			_ = stop()
 +		}
-+		if upstreamStatus, ok := c.Get(openAIRateLimitUpstreamStatusKey); ok {
-+			if v, ok := upstreamStatus.(string); ok && strings.TrimSpace(v) != "" {
-+				errObj["upstream_status_code"] = strings.TrimSpace(v)
-+			}
-+		}
-+		if upstreamRID, ok := c.Get(openAIRateLimitUpstreamRequestIDKey); ok {
-+			if v, ok := upstreamRID.(string); ok && strings.TrimSpace(v) != "" {
-+				errObj["upstream_request_id"] = strings.TrimSpace(v)
-+			}
++		if counted.Load() {
++			current := responsesOrphanActiveTasks.Add(-1)
++			log.Info("orphan_active_tasks",
++				zap.String("kind", kind),
++				zap.Int64("value", current),
++			)
 +		}
 +	}
-+	c.JSON(status, gin.H{"error": errObj})
- }
- 
- // openAICompactKeepaliveInterval 复用流式 keepalive 配置作为 compact 下游
-diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
-index 54d82a69e..45c75ae5e 100644
---- a/backend/internal/handler/wire.go
-+++ b/backend/internal/handler/wire.go
-@@ -181,29 +181,31 @@ func ProvideHandlers(
- 	paymentWebhookHandler *PaymentWebhookHandler,
- 	availableChannelHandler *AvailableChannelHandler,
- 	asyncImageHandler *AsyncImageHandler,
-+	backgroundResponseHandler *BackgroundResponseHandler,
- 	batchImageHandler *BatchImageHandler,
- 	_ *service.IdempotencyCoordinator,
- 	_ *service.IdempotencyCleanupService,
- ) *Handlers {
- 	return &Handlers{
--		Auth:             authHandler,
--		User:             userHandler,
--		APIKey:           apiKeyHandler,
--		Usage:            usageHandler,
--		Redeem:           redeemHandler,
--		Subscription:     subscriptionHandler,
--		Announcement:     announcementHandler,
--		ChannelMonitor:   channelMonitorUserHandler,
--		Admin:            adminHandlers,
--		Gateway:          gatewayHandler,
--		OpenAIGateway:    openaiGatewayHandler,
--		Setting:          settingHandler,
--		Totp:             totpHandler,
--		Payment:          paymentHandler,
--		PaymentWebhook:   paymentWebhookHandler,
--		AvailableChannel: availableChannelHandler,
--		AsyncImage:       asyncImageHandler,
--		BatchImage:       batchImageHandler,
-+		Auth:               authHandler,
-+		User:               userHandler,
-+		APIKey:             apiKeyHandler,
-+		Usage:              usageHandler,
-+		Redeem:             redeemHandler,
-+		Subscription:       subscriptionHandler,
-+		Announcement:       announcementHandler,
-+		ChannelMonitor:     channelMonitorUserHandler,
-+		Admin:              adminHandlers,
-+		Gateway:            gatewayHandler,
-+		OpenAIGateway:      openaiGatewayHandler,
-+		Setting:            settingHandler,
-+		Totp:               totpHandler,
-+		Payment:            paymentHandler,
-+		PaymentWebhook:     paymentWebhookHandler,
-+		AvailableChannel:   availableChannelHandler,
-+		AsyncImage:         asyncImageHandler,
-+		BackgroundResponse: backgroundResponseHandler,
-+		BatchImage:         batchImageHandler,
- 	}
- }
- 
-@@ -226,6 +228,7 @@ var ProviderSet = wire.NewSet(
- 	NewPaymentWebhookHandler,
- 	NewAvailableChannelHandler,
- 	NewAsyncImageHandler,
-+	NewBackgroundResponseHandler,
- 	ProvideBatchImageHandler,
- 
- 	// Admin handlers
++}
++
++func responsesOrphanActiveTasksForTest() int64 {
++	return responsesOrphanActiveTasks.Load()
++}
 diff --git a/backend/internal/repository/background_response_task_store.go b/backend/internal/repository/background_response_task_store.go
 new file mode 100644
-index 000000000..5ae0e2e46
+index 00000000..6ff8ebc9
 --- /dev/null
 +++ b/backend/internal/repository/background_response_task_store.go
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,87 @@
 +package repository
 +
 +import (
@@ -1843,15 +3203,54 @@ index 000000000..5ae0e2e46
 +	return &task, nil
 +}
 +
++func (s *backgroundResponseTaskStore) ListActive(ctx context.Context, limit int) ([]*service.BackgroundResponseTaskRecord, error) {
++	if limit <= 0 {
++		limit = 1000
++	}
++	var (
++		cursor uint64
++		out    []*service.BackgroundResponseTaskRecord
++	)
++	for {
++		keys, next, err := s.rdb.Scan(ctx, cursor, backgroundResponseTaskKeyPrefix+"*", 100).Result()
++		if err != nil {
++			return nil, err
++		}
++		cursor = next
++		for _, key := range keys {
++			data, err := s.rdb.Get(ctx, key).Bytes()
++			if err != nil {
++				if err == redis.Nil {
++					continue
++				}
++				return nil, err
++			}
++			var task service.BackgroundResponseTaskRecord
++			if err := json.Unmarshal(data, &task); err != nil {
++				continue
++			}
++			if task.Status == service.BackgroundResponseStatusQueued || task.Status == service.BackgroundResponseStatusInProgress {
++				out = append(out, &task)
++				if len(out) >= limit {
++					return out, nil
++				}
++			}
++		}
++		if cursor == 0 {
++			return out, nil
++		}
++	}
++}
++
 +func backgroundResponseTaskKey(id string) string {
 +	return backgroundResponseTaskKeyPrefix + strings.TrimSpace(id)
 +}
 diff --git a/backend/internal/repository/background_response_task_store_test.go b/backend/internal/repository/background_response_task_store_test.go
 new file mode 100644
-index 000000000..d21a376ed
+index 00000000..527a4324
 --- /dev/null
 +++ b/backend/internal/repository/background_response_task_store_test.go
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,75 @@
 +package repository
 +
 +import (
@@ -1896,136 +3295,43 @@ index 000000000..d21a376ed
 +	_, err := store.Get(context.Background(), "resp_bg_missing")
 +	require.ErrorIs(t, err, service.ErrBackgroundResponseNotFound)
 +}
-diff --git a/backend/internal/repository/wire.go b/backend/internal/repository/wire.go
-index 1ee3194ad..ef7fc9a42 100644
---- a/backend/internal/repository/wire.go
-+++ b/backend/internal/repository/wire.go
-@@ -121,6 +121,7 @@ var ProviderSet = wire.NewSet(
- 	NewUpdateCache,
- 	NewGeminiTokenCache,
- 	NewImageTaskStore,
-+	NewBackgroundResponseTaskStore,
- 	NewBatchImageQueue,
- 	NewBatchImageDownloadLimiter,
- 	NewLeaderLockCache,
-diff --git a/backend/internal/server/middleware/api_key_auth.go b/backend/internal/server/middleware/api_key_auth.go
-index a595fbdb3..49e052584 100644
---- a/backend/internal/server/middleware/api_key_auth.go
-+++ b/backend/internal/server/middleware/api_key_auth.go
-@@ -28,7 +28,7 @@ func NewAPIKeyAuthMiddleware(apiKeyService *service.APIKeyService, subscriptionS
- //   - 鉴权（Authentication）：验证 Key 有效性、用户状态、IP 限制 —— 始终执行
- //   - 计费执行（Billing Enforcement）：过期/配额/订阅/余额检查 —— skipBilling 时整块跳过
- //
--// /v1/usage、/v1/sub2api/billing 端点与异步生图任务查询只需鉴权，不需要计费执行。
-+// /v1/usage、/v1/sub2api/billing 端点与异步任务查询只需鉴权，不需要计费执行。
- // usage 允许过期/配额耗尽的 Key 查询自身用量，billing 用于读取当前 Key 的倍率配置，
- // 异步生图查询允许已耗尽额度的 Key 拉取自身任务结果。
- func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscriptionService *service.SubscriptionService, cfg *config.Config) gin.HandlerFunc {
-@@ -169,7 +169,7 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
- 		// Async image task polling only reads data that already belongs to the
- 		// authenticated key and must remain available after the completed
- 		// generation consumes the key's remaining balance.
--		skipBilling := c.Request.URL.Path == "/v1/usage" || billingInfoRequest || isAsyncImageTaskRead(c.Request.Method, c.Request.URL.Path)
-+		skipBilling := c.Request.URL.Path == "/v1/usage" || billingInfoRequest || isAsyncImageTaskRead(c.Request.Method, c.Request.URL.Path) || isBackgroundResponseRead(c.Request.Method, c.Request.URL.Path)
- 
- 		// ── 4. SimpleMode → early return ─────────────────────────────
- 
-@@ -340,6 +340,18 @@ func isAsyncImageTaskRead(method, path string) bool {
- 	return strings.HasPrefix(path, "/v1/images/tasks/") || strings.HasPrefix(path, "/images/tasks/")
- }
- 
-+func isBackgroundResponseRead(method, path string) bool {
-+	if method != http.MethodGet {
-+		return false
-+	}
-+	for _, prefix := range []string{"/v1/responses/", "/responses/"} {
-+		if strings.HasPrefix(path, prefix) && strings.TrimPrefix(path, prefix) != "" {
-+			return true
-+		}
-+	}
-+	return false
-+}
 +
- // GetAPIKeyFromContext 从上下文中获取API key
- func GetAPIKeyFromContext(c *gin.Context) (*service.APIKey, bool) {
- 	value, exists := c.Get(string(ContextKeyAPIKey))
-diff --git a/backend/internal/server/middleware/api_key_auth_image_task_test.go b/backend/internal/server/middleware/api_key_auth_image_task_test.go
-index 653fd8ba3..aa0bfd763 100644
---- a/backend/internal/server/middleware/api_key_auth_image_task_test.go
-+++ b/backend/internal/server/middleware/api_key_auth_image_task_test.go
-@@ -13,3 +13,12 @@ func TestIsAsyncImageTaskRead(t *testing.T) {
- 	require.False(t, isAsyncImageTaskRead(http.MethodPost, "/v1/images/tasks/imgtask_123"))
- 	require.False(t, isAsyncImageTaskRead(http.MethodGet, "/v1/images/generations"))
- }
++func TestBackgroundResponseTaskStoreListActive(t *testing.T) {
++	mr := miniredis.RunT(t)
++	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
++	t.Cleanup(func() { _ = rdb.Close() })
++	store := NewBackgroundResponseTaskStore(rdb)
 +
-+func TestIsBackgroundResponseRead(t *testing.T) {
-+	require.True(t, isBackgroundResponseRead(http.MethodGet, "/v1/responses/resp_bg_123"))
-+	require.True(t, isBackgroundResponseRead(http.MethodGet, "/responses/resp_bg_123"))
-+	require.False(t, isBackgroundResponseRead(http.MethodPost, "/v1/responses/resp_bg_123"))
-+	require.False(t, isBackgroundResponseRead(http.MethodGet, "/v1/responses"))
-+	// Similar prefixes must not accidentally bypass billing enforcement.
-+	require.False(t, isBackgroundResponseRead(http.MethodGet, "/v1/responses-archive/resp_bg_123"))
++	require.NoError(t, store.Save(context.Background(), &service.BackgroundResponseTaskRecord{
++		ID:        "resp_bg_active",
++		UserID:    7,
++		APIKeyID:  9,
++		Model:     "gpt-5",
++		Status:    service.BackgroundResponseStatusInProgress,
++		CreatedAt: 100,
++		ExpiresAt: 200,
++	}, time.Hour))
++	require.NoError(t, store.Save(context.Background(), &service.BackgroundResponseTaskRecord{
++		ID:        "resp_bg_done",
++		UserID:    7,
++		APIKeyID:  9,
++		Model:     "gpt-5",
++		Status:    service.BackgroundResponseStatusCompleted,
++		CreatedAt: 100,
++		ExpiresAt: 200,
++	}, time.Hour))
++
++	active, err := store.ListActive(context.Background(), 10)
++	require.NoError(t, err)
++	require.Len(t, active, 1)
++	require.Equal(t, "resp_bg_active", active[0].ID)
 +}
-diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
-index 8e14f1d5a..1159c1c74 100644
---- a/backend/internal/server/routes/gateway.go
-+++ b/backend/internal/server/routes/gateway.go
-@@ -160,6 +160,9 @@ func RegisterGatewayRoutes(
- 		// OpenAI Responses API: auto-route based on group platform
- 		gateway.POST("/responses", func(c *gin.Context) {
- 			if isOpenAIResponsesCompatibleGatewayPlatform(c) {
-+				if h.BackgroundResponse != nil && h.BackgroundResponse.TrySubmit(c) {
-+					return
-+				}
- 				h.OpenAIGateway.Responses(c)
- 				return
- 			}
-@@ -172,6 +175,14 @@ func RegisterGatewayRoutes(
- 			}
- 			h.Gateway.Responses(c)
- 		})
-+		gateway.GET("/responses/:response_id", func(c *gin.Context) {
-+			if !isOpenAIResponsesCompatibleGatewayPlatform(c) || h.BackgroundResponse == nil {
-+				service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalFeatureGate)
-+				c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"type": "not_found_error", "message": "Response not found"}})
-+				return
-+			}
-+			h.BackgroundResponse.Get(c)
-+		})
- 		gateway.POST("/alpha/search", textBodyLimit, h.OpenAIGateway.AlphaSearch)
- 		gateway.GET("/responses", func(c *gin.Context) {
- 			h.OpenAIGateway.ResponsesWebSocket(c)
-@@ -237,6 +248,9 @@ func RegisterGatewayRoutes(
- 	// OpenAI Responses API（不带v1前缀的别名）— auto-route based on group platform
- 	responsesHandler := func(c *gin.Context) {
- 		if isOpenAIResponsesCompatibleGatewayPlatform(c) {
-+			if h.BackgroundResponse != nil && h.BackgroundResponse.TrySubmit(c) {
-+				return
-+			}
- 			h.OpenAIGateway.Responses(c)
- 			return
- 		}
-@@ -244,6 +258,14 @@ func RegisterGatewayRoutes(
- 	}
- 	r.POST("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
- 	r.POST("/responses/*subpath", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
-+	r.GET("/responses/:response_id", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
-+		if !isOpenAIResponsesCompatibleGatewayPlatform(c) || h.BackgroundResponse == nil {
-+			service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalFeatureGate)
-+			c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"type": "not_found_error", "message": "Response not found"}})
-+			return
-+		}
-+		h.BackgroundResponse.Get(c)
-+	})
- 	r.POST("/alpha/search", textBodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.OpenAIGateway.AlphaSearch)
- 	r.GET("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
- 		h.OpenAIGateway.ResponsesWebSocket(c)
 diff --git a/backend/internal/service/background_response_task.go b/backend/internal/service/background_response_task.go
 new file mode 100644
-index 000000000..c6cce6d4b
+index 00000000..d994bb74
 --- /dev/null
 +++ b/backend/internal/service/background_response_task.go
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,244 @@
 +package service
 +
 +import (
@@ -2045,6 +3351,7 @@ index 000000000..c6cce6d4b
 +	BackgroundResponseStatusInProgress = "in_progress"
 +	BackgroundResponseStatusCompleted  = "completed"
 +	BackgroundResponseStatusFailed     = "failed"
++	BackgroundResponseStatusCancelled  = "cancelled"
 +
 +	defaultBackgroundResponseTTL              = 24 * time.Hour
 +	defaultBackgroundResponseExecutionTimeout = 2 * time.Hour
@@ -2082,6 +3389,7 @@ index 000000000..c6cce6d4b
 +type BackgroundResponseTaskStore interface {
 +	Save(ctx context.Context, task *BackgroundResponseTaskRecord, ttl time.Duration) error
 +	Get(ctx context.Context, id string) (*BackgroundResponseTaskRecord, error)
++	ListActive(ctx context.Context, limit int) ([]*BackgroundResponseTaskRecord, error)
 +}
 +
 +type BackgroundResponseTaskService struct {
@@ -2155,6 +3463,9 @@ index 000000000..c6cce6d4b
 +
 +func (s *BackgroundResponseTaskService) MarkInProgress(ctx context.Context, id string) error {
 +	return s.update(ctx, id, func(task *BackgroundResponseTaskRecord) {
++		if backgroundResponseTaskTerminal(task.Status) {
++			return
++		}
 +		task.Status = BackgroundResponseStatusInProgress
 +	})
 +}
@@ -2174,6 +3485,48 @@ index 000000000..c6cce6d4b
 +		taskErr = backgroundResponseErrorJSON("api_error", "background response failed")
 +	}
 +	return s.finish(ctx, id, BackgroundResponseStatusFailed, statusCode, nil, taskErr)
++}
++
++func (s *BackgroundResponseTaskService) Cancel(ctx context.Context, owner BackgroundResponseOwner, id string) (*BackgroundResponseTaskRecord, error) {
++	task, err := s.Get(ctx, owner, id)
++	if err != nil {
++		return nil, err
++	}
++	if backgroundResponseTaskTerminal(task.Status) {
++		return task, nil
++	}
++	if err := s.finish(ctx, id, BackgroundResponseStatusCancelled, http.StatusOK, nil, nil); err != nil {
++		return nil, err
++	}
++	return s.Get(ctx, owner, id)
++}
++
++func (s *BackgroundResponseTaskService) CancelByID(ctx context.Context, id string) error {
++	return s.finish(ctx, id, BackgroundResponseStatusCancelled, http.StatusOK, nil, nil)
++}
++
++func (s *BackgroundResponseTaskService) FailActiveOnStartup(ctx context.Context, limit int) (int, error) {
++	if !s.Enabled() {
++		return 0, ErrBackgroundResponseUnavailable
++	}
++	if limit <= 0 {
++		limit = 1000
++	}
++	tasks, err := s.store.ListActive(ctx, limit)
++	if err != nil {
++		return 0, ErrBackgroundResponseUnavailable.WithCause(err)
++	}
++	failed := 0
++	for _, task := range tasks {
++		if task == nil || backgroundResponseTaskTerminal(task.Status) {
++			continue
++		}
++		if err := s.Fail(ctx, task.ID, http.StatusServiceUnavailable, backgroundResponseErrorJSON("background_task_failed", "background task did not survive proxy restart")); err != nil {
++			return failed, err
++		}
++		failed++
++	}
++	return failed, nil
 +}
 +
 +func (s *BackgroundResponseTaskService) update(ctx context.Context, id string, mutate func(*BackgroundResponseTaskRecord)) error {
@@ -2196,6 +3549,9 @@ index 000000000..c6cce6d4b
 +
 +func (s *BackgroundResponseTaskService) finish(ctx context.Context, id, status string, statusCode int, result, taskErr json.RawMessage) error {
 +	return s.update(ctx, id, func(task *BackgroundResponseTaskRecord) {
++		if backgroundResponseTaskTerminal(task.Status) {
++			return
++		}
 +		now := time.Now().UTC()
 +		completedAt := now.Unix()
 +		task.Status = status
@@ -2207,16 +3563,25 @@ index 000000000..c6cce6d4b
 +	})
 +}
 +
++func backgroundResponseTaskTerminal(status string) bool {
++	switch status {
++	case BackgroundResponseStatusCompleted, BackgroundResponseStatusFailed, BackgroundResponseStatusCancelled:
++		return true
++	default:
++		return false
++	}
++}
++
 +func backgroundResponseErrorJSON(errorType, message string) json.RawMessage {
 +	data, _ := json.Marshal(map[string]string{"type": errorType, "message": message})
 +	return data
 +}
 diff --git a/backend/internal/service/background_response_task_test.go b/backend/internal/service/background_response_task_test.go
 new file mode 100644
-index 000000000..174210375
+index 00000000..9562809a
 --- /dev/null
 +++ b/backend/internal/service/background_response_task_test.go
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,149 @@
 +package service
 +
 +import (
@@ -2228,6 +3593,7 @@ index 000000000..174210375
 +	"time"
 +
 +	"github.com/stretchr/testify/require"
++	"github.com/tidwall/gjson"
 +)
 +
 +type backgroundResponseMemoryStore struct {
@@ -2262,6 +3628,19 @@ index 000000000..174210375
 +	return &copy, nil
 +}
 +
++func (s *backgroundResponseMemoryStore) ListActive(_ context.Context, limit int) ([]*BackgroundResponseTaskRecord, error) {
++	if s.task == nil {
++		return nil, nil
++	}
++	if s.task.Status != BackgroundResponseStatusQueued && s.task.Status != BackgroundResponseStatusInProgress {
++		return nil, nil
++	}
++	copy := *s.task
++	copy.Result = append(json.RawMessage(nil), s.task.Result...)
++	copy.Error = append(json.RawMessage(nil), s.task.Error...)
++	return []*BackgroundResponseTaskRecord{&copy}[:min(1, max(1, limit))], nil
++}
++
 +func TestBackgroundResponseTaskLifecycleAndOwnership(t *testing.T) {
 +	store := &backgroundResponseMemoryStore{}
 +	svc := NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, 10*time.Minute)
@@ -2294,6 +3673,42 @@ index 000000000..174210375
 +	require.NotNil(t, completed.CompletedAt)
 +}
 +
++func TestBackgroundResponseTaskCancel(t *testing.T) {
++	store := &backgroundResponseMemoryStore{}
++	svc := NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
++	owner := BackgroundResponseOwner{UserID: 7, APIKeyID: 9}
++
++	created, err := svc.Create(context.Background(), owner, "gpt-5.6-sol")
++	require.NoError(t, err)
++	cancelled, err := svc.Cancel(context.Background(), owner, created.ID)
++	require.NoError(t, err)
++	require.Equal(t, BackgroundResponseStatusCancelled, cancelled.Status)
++	require.NotNil(t, cancelled.CompletedAt)
++
++	require.NoError(t, svc.Fail(context.Background(), created.ID, http.StatusBadGateway, json.RawMessage(`{"type":"api_error","message":"late"}`)))
++	got, err := svc.Get(context.Background(), owner, created.ID)
++	require.NoError(t, err)
++	require.Equal(t, BackgroundResponseStatusCancelled, got.Status)
++}
++
++func TestBackgroundResponseTaskFailActiveOnStartup(t *testing.T) {
++	store := &backgroundResponseMemoryStore{}
++	svc := NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
++	owner := BackgroundResponseOwner{UserID: 7, APIKeyID: 9}
++	created, err := svc.Create(context.Background(), owner, "gpt-5.6-sol")
++	require.NoError(t, err)
++	require.NoError(t, svc.MarkInProgress(context.Background(), created.ID))
++
++	failed, err := svc.FailActiveOnStartup(context.Background(), 100)
++	require.NoError(t, err)
++	require.Equal(t, 1, failed)
++
++	got, err := svc.Get(context.Background(), owner, created.ID)
++	require.NoError(t, err)
++	require.Equal(t, BackgroundResponseStatusFailed, got.Status)
++	require.Equal(t, "background_task_failed", gjson.GetBytes(got.Error, "type").String())
++}
++
 +func TestBackgroundResponseTaskInvalidResultBecomesFailed(t *testing.T) {
 +	store := &backgroundResponseMemoryStore{}
 +	svc := NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
@@ -2316,226 +3731,9 @@ index 000000000..174210375
 +	_, err := svc.Create(context.Background(), BackgroundResponseOwner{UserID: 1, APIKeyID: 2}, "gpt-5")
 +	require.ErrorIs(t, err, ErrBackgroundResponseUnavailable)
 +}
-diff --git a/backend/internal/service/openai_gateway_forward.go b/backend/internal/service/openai_gateway_forward.go
-index 93697be77..b32ed413c 100644
---- a/backend/internal/service/openai_gateway_forward.go
-+++ b/backend/internal/service/openai_gateway_forward.go
-@@ -15,6 +15,7 @@ import (
- 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
- 	"github.com/gin-gonic/gin"
- 	"github.com/tidwall/gjson"
-+	"go.uber.org/zap"
- )
- 
- // Forward forwards request to OpenAI API
-@@ -76,12 +77,31 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
- 	requestView := newOpenAIRequestView(body)
- 	reqModel, reqStream, promptCacheKey := requestView.Model, requestView.Stream, requestView.PromptCacheKey
- 	originalModel := reqModel
-+	nativeContract := OpenAIResponsesNativeContract(body)
- 
- 	if account.Platform == PlatformGrok {
- 		return s.forwardGrokResponses(ctx, c, account, body, originalModel, reqStream, startTime)
- 	}
- 
- 	if account.Type == AccountTypeAPIKey && !openai_compat.ShouldUseResponsesAPI(account.Extra) {
-+		if nativeContract.RequiresNativeResponses {
-+			if c != nil {
-+				c.Set("openai_responses_requires_native", true)
-+				c.Set("openai_responses_has_web_search", nativeContract.HasHostedWebSearch)
-+				c.Set("openai_responses_include_web_search_sources", nativeContract.RequestsWebSearchSources)
-+			}
-+			logger.L().Warn("openai responses: refusing chat completions fallback for native-only request",
-+				zap.Int64("account_id", account.ID),
-+				zap.String("account_name", account.Name),
-+				zap.String("original_model", originalModel),
-+				zap.Bool("has_web_search", nativeContract.HasHostedWebSearch),
-+				zap.Bool("include_web_search_sources", nativeContract.RequestsWebSearchSources),
-+				zap.Bool("background", nativeContract.Background),
-+				zap.String("tool_choice", nativeContract.ToolChoice),
-+			)
-+			writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "upstream_configuration_error", "Selected upstream only supports Chat Completions fallback and cannot preserve native Responses hosted tool output")
-+			return nil, errors.New("responses request requires native /v1/responses upstream")
-+		}
- 		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body)
- 	}
- 
-diff --git a/backend/internal/service/openai_gateway_response_handling.go b/backend/internal/service/openai_gateway_response_handling.go
-index 2acf0a930..ccc6be6fa 100644
---- a/backend/internal/service/openai_gateway_response_handling.go
-+++ b/backend/internal/service/openai_gateway_response_handling.go
-@@ -1450,18 +1450,22 @@ func responsesStreamEventMayContributeToOutput(eventType string) bool {
- 	}
- }
- 
--// collectRawResponsesOutputItemsFromSSE 按到达顺序收集 SSE 流中
--// response.output_item.done 携带的原始 item。除已产生结果但仍停留在进行中
--// 的图片状态外，item 以 raw JSON 逐字节保留，
--// 避免经窄结构体重建时丢弃 encrypted_content/summary/opaque 等 compact
--// 专属或未来新增字段（#3777 问题 2）。若整条流没有任何 done 事件，退回
--// 收集 output_item.added 中的 compaction 类 item——compaction 结果没有
--// delta 事件，部分上游只在 added 事件中携带完整 item。
-+// collectRawResponsesOutputItemsFromSSE 按到达顺序收集 SSE 流中的原始 output
-+// item。response.output_item.done 是权威终态；对没有 delta 的 hosted tool
-+// item（例如 web_search_call.action.sources、compaction）允许用
-+// response.output_item.added 兜底。item 以 raw JSON 逐字节保留，避免经窄
-+// 结构体重建时丢弃 action.sources、encrypted_content、summary 或未来新增字段。
- func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
--	var items []json.RawMessage
--	seen := make(map[string]struct{})
--	hasCompactionItem := false
--	appendItem := func(item gjson.Result) {
-+	type rawOutputItemCandidate struct {
-+		raw      json.RawMessage
-+		fromDone bool
-+	}
-+	itemsByKey := make(map[string]rawOutputItemCandidate)
-+	order := make([]string, 0, 4)
-+	deferredAddedOrder := make([]string, 0, 1)
-+	deferredAddedSeen := make(map[string]struct{})
-+	hasDoneCompaction := false
-+	appendOrReplace := func(item gjson.Result, fromDone bool, deferAddedOrder bool) {
- 		if !item.Exists() || !item.IsObject() {
- 			return
- 		}
-@@ -1469,38 +1473,71 @@ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
- 		if key == "" {
- 			key = item.Raw
- 		}
--		if _, dup := seen[key]; dup {
-+		existing, exists := itemsByKey[key]
-+		if exists && existing.fromDone {
- 			return
- 		}
--		seen[key] = struct{}{}
--		if isResponsesCompactionItemType(item.Get("type").String()) {
--			hasCompactionItem = true
-+		if !fromDone && exists {
-+			return
-+		}
-+		if !exists && !deferAddedOrder {
-+			order = append(order, key)
- 		}
--		items = append(items, json.RawMessage(item.Raw))
-+		if !exists && deferAddedOrder {
-+			if _, seenDeferred := deferredAddedSeen[key]; !seenDeferred {
-+				deferredAddedSeen[key] = struct{}{}
-+				deferredAddedOrder = append(deferredAddedOrder, key)
-+			}
-+		}
-+		itemsByKey[key] = rawOutputItemCandidate{raw: json.RawMessage(item.Raw), fromDone: fromDone}
- 	}
- 	forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
- 		if normalized, changed := normalizeCompletedImageGenerationStatus(data); changed {
- 			data = normalized
- 		}
--		if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.done" {
--			return
-+		eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
-+		item := gjson.GetBytes(data, "item")
-+		switch eventType {
-+		case "response.output_item.done":
-+			if isResponsesCompactionItemType(item.Get("type").String()) {
-+				hasDoneCompaction = true
-+			}
-+			appendOrReplace(item, true, false)
-+		case "response.output_item.added":
-+			// message/function_call/reasoning items are assembled from deltas or
-+			// later done events; taking their early added form would create empty
-+			// or partial output. Hosted tool calls are atomic in added/done events
-+			// and must be kept even when a terminal response has output:[].
-+			if responsesOutputItemCanUseAddedFallback(item.Get("type").String()) {
-+				appendOrReplace(item, false, isResponsesCompactionItemType(item.Get("type").String()))
-+			}
- 		}
--		appendItem(gjson.GetBytes(data, "item"))
- 	})
--	// done 事件未携带 compaction item 时再看 added：覆盖"其他 item 有 done、
--	// compaction 只在 added 中"的混合形态；done 已含 compaction 时跳过，
--	// 避免同一 item 在无 id 可去重时被收集两份（Codex 要求恰好一个）。
--	if !hasCompactionItem {
--		forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
--			if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.added" {
--				return
-+	if len(deferredAddedOrder) > 0 {
-+		seenOrder := make(map[string]struct{}, len(order))
-+		for _, key := range order {
-+			seenOrder[key] = struct{}{}
-+		}
-+		for _, key := range deferredAddedOrder {
-+			if _, seen := seenOrder[key]; seen {
-+				continue
- 			}
--			item := gjson.GetBytes(data, "item")
--			if !isResponsesCompactionItemType(item.Get("type").String()) {
--				return
-+			if hasDoneCompaction {
-+				if candidate, ok := itemsByKey[key]; ok && isResponsesCompactionItemType(gjson.GetBytes(candidate.raw, "type").String()) {
-+					continue
-+				}
- 			}
--			appendItem(item)
--		})
-+			order = append(order, key)
-+		}
-+	}
-+	if len(order) == 0 {
-+		return nil, false
-+	}
-+	items := make([]json.RawMessage, 0, len(order))
-+	for _, key := range order {
-+		if candidate, ok := itemsByKey[key]; ok && len(candidate.raw) > 0 {
-+			items = append(items, candidate.raw)
-+		}
- 	}
- 	if len(items) == 0 {
- 		return nil, false
-@@ -1512,6 +1549,26 @@ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
- 	return outputJSON, true
- }
- 
-+func responsesOutputItemCanUseAddedFallback(itemType string) bool {
-+	switch strings.TrimSpace(itemType) {
-+	case "web_search_call",
-+		"file_search_call",
-+		"image_generation_call",
-+		"code_interpreter_call",
-+		"computer_call",
-+		"mcp_call",
-+		"mcp_approval_request",
-+		"mcp_list_tools",
-+		"local_shell_call",
-+		"custom_tool_call",
-+		"compaction",
-+		"compaction_summary":
-+		return true
-+	default:
-+		return false
-+	}
-+}
-+
- // isResponsesCompactionItemType reports whether the item type is the Codex
- // remote-compact result item ("compaction", upstream alias "compaction_summary").
- func isResponsesCompactionItemType(itemType string) bool {
-diff --git a/backend/internal/service/openai_gateway_responses_chat_fallback.go b/backend/internal/service/openai_gateway_responses_chat_fallback.go
-index 1082b020d..027d2ac12 100644
---- a/backend/internal/service/openai_gateway_responses_chat_fallback.go
-+++ b/backend/internal/service/openai_gateway_responses_chat_fallback.go
-@@ -25,6 +25,11 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
- 	body []byte,
- ) (*OpenAIForwardResult, error) {
- 	startTime := time.Now()
-+	if OpenAIResponsesRequestRequiresNativeResponses(body) {
-+		msg := "Responses request requires native /v1/responses hosted tool output; Chat Completions fallback cannot preserve web_search_call.action.sources"
-+		writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "upstream_configuration_error", msg)
-+		return nil, errors.New("responses request requires native /v1/responses upstream")
-+	}
- 
- 	var responsesReq apicompat.ResponsesRequest
- 	if err := json.Unmarshal(body, &responsesReq); err != nil {
 diff --git a/backend/internal/service/openai_responses_native_contract.go b/backend/internal/service/openai_responses_native_contract.go
 new file mode 100644
-index 000000000..85f5be063
+index 00000000..85f5be06
 --- /dev/null
 +++ b/backend/internal/service/openai_responses_native_contract.go
 @@ -0,0 +1,117 @@
@@ -2658,7 +3856,7 @@ index 000000000..85f5be063
 +}
 diff --git a/backend/internal/service/openai_responses_web_search_test.go b/backend/internal/service/openai_responses_web_search_test.go
 new file mode 100644
-index 000000000..5b80fc5d7
+index 00000000..5b80fc5d
 --- /dev/null
 +++ b/backend/internal/service/openai_responses_web_search_test.go
 @@ -0,0 +1,172 @@
@@ -2834,209 +4032,3 @@ index 000000000..5b80fc5d7
 +	require.Equal(t, 4, result.usage.InputTokens)
 +	require.Equal(t, 3, result.usage.OutputTokens)
 +}
-diff --git a/backend/internal/service/update_service.go b/backend/internal/service/update_service.go
-index 82df3bb02..a6b885759 100644
---- a/backend/internal/service/update_service.go
-+++ b/backend/internal/service/update_service.go
-@@ -25,12 +25,17 @@ import (
- var (
- 	ErrNoUpdateAvailable         = infraerrors.Conflict("ALREADY_UP_TO_DATE", "no update available; current version is latest")
- 	ErrRollbackVersionNotAllowed = infraerrors.BadRequest("ROLLBACK_VERSION_NOT_ALLOWED", "version is not in the allowed rollback list")
-+	ErrCustomBuildUpdateDisabled = infraerrors.Conflict("CUSTOM_BUILD_UPDATE_DISABLED", "direct official updates are disabled for this custom build; use the SubtoProxy custom update channel")
- )
- 
- const (
- 	updateCacheKey = "update_check_cache"
- 	updateCacheTTL = 1200 // 20 minutes
--	githubRepo     = "Wei-Shaw/sub2api"
-+	// githubRepo is intentionally pinned to the SubtoProxy custom release
-+	// channel. Release builds must never download the upstream binary directly,
-+	// because doing so would overwrite the background-response compatibility
-+	// layer carried by this fork.
-+	githubRepo = "0xblackbox/sub2api-custom"
- 
- 	// Security: allowed download domains for updates
- 	allowedDownloadHost = "github.com"
-@@ -163,6 +168,9 @@ func (s *UpdateService) CheckUpdate(ctx context.Context, force bool) (*UpdateInf
- // PerformUpdate downloads and applies the update
- // Uses atomic file replacement pattern for safe in-place updates
- func (s *UpdateService) PerformUpdate(ctx context.Context) error {
-+	if s == nil || s.buildType != "release" {
-+		return ErrCustomBuildUpdateDisabled
-+	}
- 	info, err := s.CheckUpdate(ctx, true)
- 	if err != nil {
- 		return err
-@@ -281,6 +289,9 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
- 
- // Rollback restores the previous version
- func (s *UpdateService) Rollback() error {
-+	if s == nil || s.buildType != "release" {
-+		return ErrCustomBuildUpdateDisabled
-+	}
- 	exePath, err := os.Executable()
- 	if err != nil {
- 		return fmt.Errorf("failed to get executable path: %w", err)
-@@ -327,6 +338,9 @@ func (s *UpdateService) ListRollbackVersions(ctx context.Context) ([]RollbackVer
- // The target must be one of the versions returned by ListRollbackVersions;
- // anything else (including the current version) is rejected.
- func (s *UpdateService) RollbackToVersion(ctx context.Context, version string) error {
-+	if s == nil || s.buildType != "release" {
-+		return ErrCustomBuildUpdateDisabled
-+	}
- 	target := strings.TrimPrefix(strings.TrimSpace(version), "v")
- 	if target == "" {
- 		return ErrRollbackVersionNotAllowed
-@@ -643,23 +657,50 @@ func compareVersions(current, latest string) int {
- 	latestParts := parseVersion(latest)
- 
- 	for i := 0; i < 3; i++ {
--		if currentParts[i] < latestParts[i] {
-+		if currentParts.core[i] < latestParts.core[i] {
- 			return -1
- 		}
--		if currentParts[i] > latestParts[i] {
-+		if currentParts.core[i] > latestParts.core[i] {
- 			return 1
- 		}
- 	}
-+
-+	// Custom channel releases use versions such as 0.1.160-custom.3. The old
-+	// parser treated "160-custom" as zero, which made every custom revision
-+	// look identical. For the same upstream base version, a custom build is
-+	// considered newer than the unpatched upstream build, and custom revisions
-+	// are ordered numerically.
-+	if currentParts.customRevision < latestParts.customRevision {
-+		return -1
-+	}
-+	if currentParts.customRevision > latestParts.customRevision {
-+		return 1
-+	}
- 	return 0
- }
- 
--func parseVersion(v string) [3]int {
-+type parsedUpdateVersion struct {
-+	core           [3]int
-+	customRevision int
-+}
-+
-+func parseVersion(v string) parsedUpdateVersion {
- 	v = strings.TrimPrefix(v, "v")
--	parts := strings.Split(v, ".")
--	result := [3]int{0, 0, 0}
-+	v = strings.SplitN(v, "+", 2)[0]
-+	versionAndSuffix := strings.SplitN(v, "-", 2)
-+	parts := strings.Split(versionAndSuffix[0], ".")
-+	result := parsedUpdateVersion{}
- 	for i := 0; i < len(parts) && i < 3; i++ {
- 		if parsed, err := strconv.Atoi(parts[i]); err == nil {
--			result[i] = parsed
-+			result.core[i] = parsed
-+		}
-+	}
-+	if len(versionAndSuffix) == 2 {
-+		suffixParts := strings.Split(versionAndSuffix[1], ".")
-+		if len(suffixParts) == 2 && suffixParts[0] == "custom" {
-+			if revision, err := strconv.Atoi(suffixParts[1]); err == nil && revision > 0 {
-+				result.customRevision = revision
-+			}
- 		}
- 	}
- 	return result
-diff --git a/backend/internal/service/update_service_test.go b/backend/internal/service/update_service_test.go
-index 243e25d1e..490b97092 100644
---- a/backend/internal/service/update_service_test.go
-+++ b/backend/internal/service/update_service_test.go
-@@ -69,6 +69,40 @@ func TestUpdateServicePerformUpdateNoUpdateReturnsSentinel(t *testing.T) {
- 	require.ErrorIs(t, err, ErrNoUpdateAvailable)
- }
- 
-+func TestUpdateServiceCustomBuildRejectsOfficialBinaryReplacement(t *testing.T) {
-+	svc := NewUpdateService(
-+		&updateServiceCacheStub{},
-+		&updateServiceGitHubClientStub{},
-+		"0.1.160-custom.1",
-+		"source",
-+	)
-+
-+	require.ErrorIs(t, svc.PerformUpdate(context.Background()), ErrCustomBuildUpdateDisabled)
-+	require.ErrorIs(t, svc.Rollback(), ErrCustomBuildUpdateDisabled)
-+	require.ErrorIs(t, svc.RollbackToVersion(context.Background(), "0.1.159"), ErrCustomBuildUpdateDisabled)
-+}
-+
-+func TestCompareVersionsOrdersCustomChannelRevisions(t *testing.T) {
-+	tests := []struct {
-+		current string
-+		latest  string
-+		want    int
-+	}{
-+		{current: "0.1.160-custom.2", latest: "0.1.160-custom.3", want: -1},
-+		{current: "v0.1.160-custom.10", latest: "0.1.160-custom.3", want: 1},
-+		{current: "0.1.160", latest: "0.1.160-custom.1", want: -1},
-+		{current: "0.1.160-custom.3", latest: "0.1.161-custom.1", want: -1},
-+		{current: "0.1.161-custom.1", latest: "0.1.160-custom.99", want: 1},
-+		{current: "0.1.160-custom.3+build.7", latest: "0.1.160-custom.3", want: 0},
-+	}
-+
-+	for _, tt := range tests {
-+		t.Run(tt.current+"_vs_"+tt.latest, func(t *testing.T) {
-+			require.Equal(t, tt.want, compareVersions(tt.current, tt.latest))
-+		})
-+	}
-+}
-+
- func newRollbackTestService(current string, releases []*GitHubRelease) *UpdateService {
- 	return NewUpdateService(
- 		&updateServiceCacheStub{},
-diff --git a/backend/internal/service/wire.go b/backend/internal/service/wire.go
-index 913cb6ba7..a0961d1da 100644
---- a/backend/internal/service/wire.go
-+++ b/backend/internal/service/wire.go
-@@ -696,6 +696,7 @@ var ProviderSet = wire.NewSet(
- 	NewOpenAIGatewayService,
- 	ProvideImageStorageSettingService,
- 	ProvideImageTaskService,
-+	NewBackgroundResponseTaskService,
- 	ProvideBatchImageModelPricingResolver,
- 	NewBatchImagePublicService,
- 	NewBatchImageDownloadService,
-diff --git a/frontend/src/api/admin/system.ts b/frontend/src/api/admin/system.ts
-index 1c057c849..34c3ec51b 100644
---- a/frontend/src/api/admin/system.ts
-+++ b/frontend/src/api/admin/system.ts
-@@ -43,6 +43,7 @@ export async function checkUpdates(force = false): Promise<VersionInfo> {
- export interface UpdateResult {
-   message: string
-   need_restart: boolean
-+  auto_restart?: boolean
- }
- 
- export interface RollbackVersionInfo {
-diff --git a/frontend/src/components/common/VersionBadge.vue b/frontend/src/components/common/VersionBadge.vue
-index 7fd62947f..5b4ffd097 100644
---- a/frontend/src/components/common/VersionBadge.vue
-+++ b/frontend/src/components/common/VersionBadge.vue
-@@ -765,6 +765,9 @@ async function handleUpdate() {
-     needRestart.value = result.need_restart
-     // Clear version cache to reflect update completed
-     appStore.clearVersionCache()
-+    if (result.auto_restart) {
-+      beginRestartCountdown()
-+    }
-   } catch (error: unknown) {
-     const err = error as { response?: { data?: { message?: string } }; message?: string }
-     updateError.value = err.response?.data?.message || err.message || t('version.updateFailed')
-@@ -862,6 +865,12 @@ async function handleRestart() {
-     console.log('Service restarting...')
-   }
- 
-+  beginRestartCountdown()
-+}
-+
-+function beginRestartCountdown() {
-+  restarting.value = true
-+  restartCountdown.value = 8
-   // Start countdown
-   const countdownInterval = setInterval(() => {
-     restartCountdown.value--

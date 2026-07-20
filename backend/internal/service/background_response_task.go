@@ -17,6 +17,7 @@ const (
 	BackgroundResponseStatusInProgress = "in_progress"
 	BackgroundResponseStatusCompleted  = "completed"
 	BackgroundResponseStatusFailed     = "failed"
+	BackgroundResponseStatusCancelled  = "cancelled"
 
 	defaultBackgroundResponseTTL              = 24 * time.Hour
 	defaultBackgroundResponseExecutionTimeout = 2 * time.Hour
@@ -54,6 +55,7 @@ type BackgroundResponseOwner struct {
 type BackgroundResponseTaskStore interface {
 	Save(ctx context.Context, task *BackgroundResponseTaskRecord, ttl time.Duration) error
 	Get(ctx context.Context, id string) (*BackgroundResponseTaskRecord, error)
+	ListActive(ctx context.Context, limit int) ([]*BackgroundResponseTaskRecord, error)
 }
 
 type BackgroundResponseTaskService struct {
@@ -127,6 +129,9 @@ func (s *BackgroundResponseTaskService) Get(ctx context.Context, owner Backgroun
 
 func (s *BackgroundResponseTaskService) MarkInProgress(ctx context.Context, id string) error {
 	return s.update(ctx, id, func(task *BackgroundResponseTaskRecord) {
+		if backgroundResponseTaskTerminal(task.Status) {
+			return
+		}
 		task.Status = BackgroundResponseStatusInProgress
 	})
 }
@@ -146,6 +151,48 @@ func (s *BackgroundResponseTaskService) Fail(ctx context.Context, id string, sta
 		taskErr = backgroundResponseErrorJSON("api_error", "background response failed")
 	}
 	return s.finish(ctx, id, BackgroundResponseStatusFailed, statusCode, nil, taskErr)
+}
+
+func (s *BackgroundResponseTaskService) Cancel(ctx context.Context, owner BackgroundResponseOwner, id string) (*BackgroundResponseTaskRecord, error) {
+	task, err := s.Get(ctx, owner, id)
+	if err != nil {
+		return nil, err
+	}
+	if backgroundResponseTaskTerminal(task.Status) {
+		return task, nil
+	}
+	if err := s.finish(ctx, id, BackgroundResponseStatusCancelled, http.StatusOK, nil, nil); err != nil {
+		return nil, err
+	}
+	return s.Get(ctx, owner, id)
+}
+
+func (s *BackgroundResponseTaskService) CancelByID(ctx context.Context, id string) error {
+	return s.finish(ctx, id, BackgroundResponseStatusCancelled, http.StatusOK, nil, nil)
+}
+
+func (s *BackgroundResponseTaskService) FailActiveOnStartup(ctx context.Context, limit int) (int, error) {
+	if !s.Enabled() {
+		return 0, ErrBackgroundResponseUnavailable
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+	tasks, err := s.store.ListActive(ctx, limit)
+	if err != nil {
+		return 0, ErrBackgroundResponseUnavailable.WithCause(err)
+	}
+	failed := 0
+	for _, task := range tasks {
+		if task == nil || backgroundResponseTaskTerminal(task.Status) {
+			continue
+		}
+		if err := s.Fail(ctx, task.ID, http.StatusServiceUnavailable, backgroundResponseErrorJSON("background_task_failed", "background task did not survive proxy restart")); err != nil {
+			return failed, err
+		}
+		failed++
+	}
+	return failed, nil
 }
 
 func (s *BackgroundResponseTaskService) update(ctx context.Context, id string, mutate func(*BackgroundResponseTaskRecord)) error {
@@ -168,6 +215,9 @@ func (s *BackgroundResponseTaskService) update(ctx context.Context, id string, m
 
 func (s *BackgroundResponseTaskService) finish(ctx context.Context, id, status string, statusCode int, result, taskErr json.RawMessage) error {
 	return s.update(ctx, id, func(task *BackgroundResponseTaskRecord) {
+		if backgroundResponseTaskTerminal(task.Status) {
+			return
+		}
 		now := time.Now().UTC()
 		completedAt := now.Unix()
 		task.Status = status
@@ -177,6 +227,15 @@ func (s *BackgroundResponseTaskService) finish(ctx context.Context, id, status s
 		task.CompletedAt = &completedAt
 		task.ExpiresAt = now.Add(s.ttl).Unix()
 	})
+}
+
+func backgroundResponseTaskTerminal(status string) bool {
+	switch status {
+	case BackgroundResponseStatusCompleted, BackgroundResponseStatusFailed, BackgroundResponseStatusCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 func backgroundResponseErrorJSON(errorType, message string) json.RawMessage {

@@ -42,3 +42,34 @@ func TestBackgroundResponseTaskStoreMissing(t *testing.T) {
 	_, err := store.Get(context.Background(), "resp_bg_missing")
 	require.ErrorIs(t, err, service.ErrBackgroundResponseNotFound)
 }
+
+func TestBackgroundResponseTaskStoreListActive(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	store := NewBackgroundResponseTaskStore(rdb)
+
+	require.NoError(t, store.Save(context.Background(), &service.BackgroundResponseTaskRecord{
+		ID:        "resp_bg_active",
+		UserID:    7,
+		APIKeyID:  9,
+		Model:     "gpt-5",
+		Status:    service.BackgroundResponseStatusInProgress,
+		CreatedAt: 100,
+		ExpiresAt: 200,
+	}, time.Hour))
+	require.NoError(t, store.Save(context.Background(), &service.BackgroundResponseTaskRecord{
+		ID:        "resp_bg_done",
+		UserID:    7,
+		APIKeyID:  9,
+		Model:     "gpt-5",
+		Status:    service.BackgroundResponseStatusCompleted,
+		CreatedAt: 100,
+		ExpiresAt: 200,
+	}, time.Hour))
+
+	active, err := store.ListActive(context.Background(), 10)
+	require.NoError(t, err)
+	require.Len(t, active, 1)
+	require.Equal(t, "resp_bg_active", active[0].ID)
+}

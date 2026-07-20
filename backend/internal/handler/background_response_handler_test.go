@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
+	"go.uber.org/zap"
 )
 
 type backgroundResponseHandlerMemoryStore struct {
@@ -44,6 +45,25 @@ func (s *backgroundResponseHandlerMemoryStore) Get(_ context.Context, id string)
 	copy.Result = append(json.RawMessage(nil), task.Result...)
 	copy.Error = append(json.RawMessage(nil), task.Error...)
 	return &copy, nil
+}
+
+func (s *backgroundResponseHandlerMemoryStore) ListActive(_ context.Context, limit int) ([]*service.BackgroundResponseTaskRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []*service.BackgroundResponseTaskRecord
+	for _, task := range s.tasks {
+		if task.Status != service.BackgroundResponseStatusQueued && task.Status != service.BackgroundResponseStatusInProgress {
+			continue
+		}
+		copy := *task
+		copy.Result = append(json.RawMessage(nil), task.Result...)
+		copy.Error = append(json.RawMessage(nil), task.Error...)
+		out = append(out, &copy)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 func TestBackgroundResponseSubmitSurvivesDisconnectAndPollsFinalResult(t *testing.T) {
@@ -205,6 +225,70 @@ func TestBackgroundResponseTrySubmitRestoresNormalRequest(t *testing.T) {
 	require.Equal(t, original, w.Body.String())
 }
 
+func TestBackgroundResponseTrySubmitDoesNotDetachSynchronousHeavyRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := &BackgroundResponseHandler{tasks: service.NewBackgroundResponseTaskService(&backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)})}
+	router := gin.New()
+	router.POST("/v1/responses", func(c *gin.Context) {
+		require.False(t, h.TrySubmit(c))
+		body, err := io.ReadAll(c.Request.Body)
+		require.NoError(t, err)
+		c.Data(http.StatusOK, "application/json", body)
+	})
+
+	original := heavyWebSearchRequestBody(false)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(original))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.JSONEq(t, original, w.Body.String())
+}
+
+func TestBackgroundResponseCancelQueuedTask(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
+	block := make(chan struct{})
+	started := make(chan struct{}, 1)
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue()}
+	h.execute = func(c *gin.Context) {
+		started <- struct{}{}
+		<-block
+		c.JSON(http.StatusOK, gin.H{"id": "resp_upstream", "object": "response", "status": service.BackgroundResponseStatusCompleted, "output": []gin.H{}})
+	}
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{ID: 9, UserID: 7})
+		c.Next()
+	})
+	router.POST("/v1/responses", func(c *gin.Context) { require.True(t, h.TrySubmit(c)) })
+	router.POST("/v1/responses/*subpath", func(c *gin.Context) { require.True(t, h.TryCancel(c)) })
+	router.GET("/v1/responses/:response_id", h.Get)
+
+	firstID := submitHeavyBackgroundForTest(t, router)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first heavy background request did not start")
+	}
+	secondID := submitHeavyBackgroundForTest(t, router)
+	require.NotEmpty(t, firstID)
+	require.NotEmpty(t, secondID)
+
+	cancelReq := httptest.NewRequest(http.MethodPost, "/v1/responses/"+secondID+"/cancel", nil)
+	cancelWriter := httptest.NewRecorder()
+	router.ServeHTTP(cancelWriter, cancelReq)
+	require.Equal(t, http.StatusOK, cancelWriter.Code)
+	require.Contains(t, cancelWriter.Body.String(), `"status":"cancelled"`)
+
+	close(block)
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, secondID)
+		return err == nil && got.Status == service.BackgroundResponseStatusCancelled
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestBackgroundResponseRejectsStoreFalse(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
@@ -224,7 +308,7 @@ func TestBackgroundResponseRejectsStoreFalse(t *testing.T) {
 	require.Empty(t, store.tasks)
 }
 
-func TestBackgroundResponseAutoSubmitsHeavyWebSearchRequest(t *testing.T) {
+func TestBackgroundResponseSubmitHeavyWebSearchBackgroundRequest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
 	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
@@ -264,11 +348,11 @@ func TestBackgroundResponseAutoSubmitsHeavyWebSearchRequest(t *testing.T) {
 	})
 	router.POST("/v1/responses", func(c *gin.Context) { require.True(t, h.TrySubmit(c)) })
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchRequestBody(false)))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchBackgroundRequestBody()))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, "true", w.Header().Get("X-SubtoProxy-Auto-Background"))
+	require.Empty(t, w.Header().Get("X-SubtoProxy-Auto-Background"))
 	require.Equal(t, "heavy_web_search", w.Header().Get("X-SubtoProxy-Background-Queue"))
 	require.Equal(t, "3", w.Header().Get("Retry-After"))
 
@@ -376,13 +460,118 @@ func TestBackgroundResponseHeavyQueueSerializesByUser(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestBackgroundResponseHeavyQueueFullAndCancel(t *testing.T) {
+	q := newBackgroundResponseHeavyQueueWithOptions(1, 1, 1)
+	firstRelease, _, err := q.acquire(context.Background(), 7)
+	require.NoError(t, err)
+	defer firstRelease()
+
+	secondCtx, secondCancel := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() {
+		release, _, acquireErr := q.acquire(secondCtx, 7)
+		if release != nil {
+			release()
+		}
+		secondDone <- acquireErr
+	}()
+	require.Eventually(t, func() bool { return q.waitingCount() == 1 }, time.Second, 10*time.Millisecond)
+
+	_, _, err = q.acquire(context.Background(), 7)
+	require.ErrorIs(t, err, errBackgroundHeavyQueueFull)
+
+	secondCancel()
+	require.ErrorIs(t, <-secondDone, context.Canceled)
+	require.Eventually(t, func() bool { return q.waitingCount() == 0 }, time.Second, 10*time.Millisecond)
+}
+
+func TestResponsesHeavySchedulerCancelsAndSkipsUserSlot(t *testing.T) {
+	oldQueue := defaultBackgroundResponseHeavyQueue
+	defaultBackgroundResponseHeavyQueue = newBackgroundResponseHeavyQueueWithOptions(1, 1, 4)
+	defer func() { defaultBackgroundResponseHeavyQueue = oldQueue }()
+
+	gin.SetMode(gin.TestMode)
+	requestCtx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchRequestBody(false))).WithContext(requestCtx)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+
+	h := &OpenAIGatewayHandler{}
+	release, ok := h.acquireResponsesHeavyWebSearchSlot(c, []byte(heavyWebSearchRequestBody(false)), 7, 9, zap.NewNop())
+	require.True(t, ok)
+	require.NotNil(t, release)
+	skip, _ := c.Get(responsesSkipUserSlotKey)
+	require.True(t, skip.(bool))
+
+	streamStarted := false
+	userRelease, acquired := h.acquireResponsesUserSlot(c, 7, 1, false, &streamStarted, zap.NewNop())
+	require.True(t, acquired)
+	require.Nil(t, userRelease)
+
+	cancel()
+	require.Eventually(t, func() bool {
+		nextRelease, _, err := defaultBackgroundResponseHeavyQueue.acquire(context.Background(), 7)
+		if err != nil {
+			return false
+		}
+		nextRelease()
+		return true
+	}, time.Second, 10*time.Millisecond)
+	release()
+	require.Equal(t, int64(0), responsesOrphanActiveTasksForTest())
+}
+
+func TestResponsesIngressCountsEntryPollAndCancelSeparately(t *testing.T) {
+	resetResponsesIngressMetricsForTest()
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
+	h := &BackgroundResponseHandler{tasks: tasks}
+	h.execute = func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"id": "resp_upstream", "object": "response", "status": service.BackgroundResponseStatusCompleted, "output": []gin.H{}})
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{ID: 9, UserID: 7})
+		c.Next()
+	})
+	router.POST("/v1/responses", func(c *gin.Context) { require.True(t, h.TrySubmit(c)) })
+	router.POST("/v1/responses/*subpath", func(c *gin.Context) { require.True(t, h.TryCancel(c)) })
+	router.GET("/v1/responses/:response_id", h.Get)
+
+	id := submitHeavyBackgroundForTest(t, router)
+	pollReq := httptest.NewRequest(http.MethodGet, "/v1/responses/"+id, nil)
+	pollWriter := httptest.NewRecorder()
+	router.ServeHTTP(pollWriter, pollReq)
+	require.Equal(t, http.StatusOK, pollWriter.Code)
+
+	cancelReq := httptest.NewRequest(http.MethodPost, "/v1/responses/"+id+"/cancel", nil)
+	cancelWriter := httptest.NewRecorder()
+	router.ServeHTTP(cancelWriter, cancelReq)
+	require.Equal(t, http.StatusOK, cancelWriter.Code)
+
+	require.Equal(t, uint64(1), responsesIngressKindCountForTest("responses_post"))
+	require.Equal(t, uint64(1), responsesIngressKindCountForTest("background_poll"))
+	require.Equal(t, uint64(1), responsesIngressKindCountForTest("background_cancel"))
+	require.Equal(t, uint64(0), responsesIngressKindCountForTest("internal_background_execute"))
+}
+
+func TestBackgroundResponseFailureClassification(t *testing.T) {
+	rateLimited := classifyBackgroundResponseFailure(http.StatusTooManyRequests, []byte(`{"error":{"message":"slow down"}}`), json.RawMessage(`{"type":"rate_limit_error","message":"slow down"}`))
+	require.Equal(t, "upstream_rate_limited", gjson.GetBytes(rateLimited, "type").String())
+	require.Equal(t, "slow down", gjson.GetBytes(rateLimited, "message").String())
+
+	eof := classifyBackgroundResponseFailure(http.StatusBadGateway, []byte("unexpected EOF"), backgroundResponseErrorPayload("api_error", "unexpected EOF"))
+	require.Equal(t, "upstream_unexpected_eof", gjson.GetBytes(eof, "type").String())
+}
+
 func submitHeavyBackgroundForTest(t *testing.T, router http.Handler) string {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchRequestBody(false)))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchBackgroundRequestBody()))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, "true", w.Header().Get("X-SubtoProxy-Auto-Background"))
 	var accepted struct {
 		ID string `json:"id"`
 	}
@@ -408,6 +597,10 @@ func heavyWebSearchRequestBody(background bool) string {
 		"max_output_tokens":8000,
 		"input":"Return strict JSON using a consulted source."` + backgroundField + `
 	}`
+}
+
+func heavyWebSearchBackgroundRequestBody() string {
+	return strings.Replace(heavyWebSearchRequestBody(true), `"store":false`, `"store":true`, 1)
 }
 
 func jsonPathBool(body []byte, path string) bool {

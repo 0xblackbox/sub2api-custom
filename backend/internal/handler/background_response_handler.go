@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,29 +32,55 @@ type BackgroundResponseHandler struct {
 	openAI     *OpenAIGatewayHandler
 	execute    func(c *gin.Context)
 	heavyQueue *backgroundResponseHeavyQueue
+	running    sync.Map // response_id -> context.CancelFunc
 }
 
 func NewBackgroundResponseHandler(tasks *service.BackgroundResponseTaskService, openAI *OpenAIGatewayHandler) *BackgroundResponseHandler {
 	h := &BackgroundResponseHandler{tasks: tasks, openAI: openAI, heavyQueue: defaultBackgroundResponseHeavyQueue}
 	h.execute = h.executeWithGateway
+	h.failActiveBackgroundTasksOnStartup()
 	return h
 }
 
-const backgroundResponseUserSlotWaitTimeoutKey = "subtoproxy_background_response_user_slot_wait_timeout"
+const (
+	backgroundResponseUserSlotWaitTimeoutKey = "subtoproxy_background_response_user_slot_wait_timeout"
+	responsesSkipUserSlotKey                 = "subtoproxy_responses_skip_user_slot"
+	responsesHeavySlotAlreadyAcquiredKey     = "subtoproxy_responses_heavy_slot_already_acquired"
+)
 
 var defaultBackgroundResponseHeavyQueue = newBackgroundResponseHeavyQueue()
 
-type backgroundResponseHeavyQueue struct {
-	global chan struct{}
+var errBackgroundHeavyQueueFull = errors.New("heavy web search queue full")
 
-	mu    sync.Mutex
-	users map[int64]chan struct{}
+type backgroundResponseHeavyQueue struct {
+	global          chan struct{}
+	perUserCapacity int
+	maxWaiting      int
+
+	mu      sync.Mutex
+	users   map[int64]chan struct{}
+	waiting int
 }
 
 func newBackgroundResponseHeavyQueue() *backgroundResponseHeavyQueue {
+	return newBackgroundResponseHeavyQueueWithOptions(1, 1, 64)
+}
+
+func newBackgroundResponseHeavyQueueWithOptions(globalConcurrency, perUserConcurrency, maxWaiting int) *backgroundResponseHeavyQueue {
+	if globalConcurrency <= 0 {
+		globalConcurrency = 1
+	}
+	if perUserConcurrency <= 0 {
+		perUserConcurrency = 1
+	}
+	if maxWaiting < 0 {
+		maxWaiting = 0
+	}
 	return &backgroundResponseHeavyQueue{
-		global: make(chan struct{}, 1),
-		users:  make(map[int64]chan struct{}),
+		global:          make(chan struct{}, globalConcurrency),
+		perUserCapacity: perUserConcurrency,
+		maxWaiting:      maxWaiting,
+		users:           make(map[int64]chan struct{}),
 	}
 }
 
@@ -62,25 +89,76 @@ func (q *backgroundResponseHeavyQueue) acquire(ctx context.Context, userID int64
 		return func() {}, 0, nil
 	}
 	start := time.Now()
+	userCh := q.userChannel(userID)
+
+	if release, ok := q.tryAcquire(userCh); ok {
+		return release, time.Since(start), nil
+	}
+	if !q.reserveWaitingSlot() {
+		return nil, time.Since(start), errBackgroundHeavyQueueFull
+	}
+	defer q.releaseWaitingSlot()
+
 	select {
-	case q.global <- struct{}{}:
+	case userCh <- struct{}{}:
 	case <-ctx.Done():
 		return nil, time.Since(start), ctx.Err()
 	}
+	select {
+	case q.global <- struct{}{}:
+		return q.releaseFunc(userCh), time.Since(start), nil
+	case <-ctx.Done():
+		<-userCh
+		return nil, time.Since(start), ctx.Err()
+	}
+}
 
-	userCh := q.userChannel(userID)
+func (q *backgroundResponseHeavyQueue) tryAcquire(userCh chan struct{}) (func(), bool) {
 	select {
 	case userCh <- struct{}{}:
-		var once sync.Once
-		return func() {
-			once.Do(func() {
-				<-userCh
-				<-q.global
-			})
-		}, time.Since(start), nil
-	case <-ctx.Done():
-		<-q.global
-		return nil, time.Since(start), ctx.Err()
+	default:
+		return nil, false
+	}
+	select {
+	case q.global <- struct{}{}:
+		return q.releaseFunc(userCh), true
+	default:
+		<-userCh
+		return nil, false
+	}
+}
+
+func (q *backgroundResponseHeavyQueue) releaseFunc(userCh chan struct{}) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			<-q.global
+			<-userCh
+		})
+	}
+}
+
+func (q *backgroundResponseHeavyQueue) canAcceptWaitingSlot() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.waiting < q.maxWaiting
+}
+
+func (q *backgroundResponseHeavyQueue) reserveWaitingSlot() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.waiting >= q.maxWaiting {
+		return false
+	}
+	q.waiting++
+	return true
+}
+
+func (q *backgroundResponseHeavyQueue) releaseWaitingSlot() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.waiting > 0 {
+		q.waiting--
 	}
 }
 
@@ -89,10 +167,19 @@ func (q *backgroundResponseHeavyQueue) userChannel(userID int64) chan struct{} {
 	defer q.mu.Unlock()
 	ch := q.users[userID]
 	if ch == nil {
-		ch = make(chan struct{}, 1)
+		ch = make(chan struct{}, q.perUserCapacity)
 		q.users[userID] = ch
 	}
 	return ch
+}
+
+func (q *backgroundResponseHeavyQueue) waitingCount() int {
+	if q == nil {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.waiting
 }
 
 func (h *BackgroundResponseHandler) acquireHeavyWebSearchQueue(ctx context.Context, userID int64) (func(), time.Duration, error) {
@@ -101,6 +188,24 @@ func (h *BackgroundResponseHandler) acquireHeavyWebSearchQueue(ctx context.Conte
 		q = h.heavyQueue
 	}
 	return q.acquire(ctx, userID)
+}
+
+func (h *BackgroundResponseHandler) failActiveBackgroundTasksOnStartup() {
+	if h == nil || h.tasks == nil || !h.tasks.Enabled() {
+		return
+	}
+	go func() {
+		failed, err := h.tasks.FailActiveOnStartup(context.Background(), 1000)
+		fields := []zap.Field{zap.Int("failed_active_tasks", failed)}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+			logger.L().Warn("background_response.startup_recovery_failed", fields...)
+			return
+		}
+		if failed > 0 {
+			logger.L().Warn("background_response.startup_recovered_active_tasks", fields...)
+		}
+	}()
 }
 
 // TrySubmit returns true when it handled the request. For a normal Responses
@@ -126,15 +231,11 @@ func (h *BackgroundResponseHandler) TrySubmit(c *gin.Context) bool {
 	restoreBackgroundResponseRequestBody(c.Request, body)
 	background := gjson.GetBytes(body, "background")
 	if background.Exists() && background.Type == gjson.True {
-		h.submit(c, body, backgroundResponseSubmitOptions{})
+		recordResponsesIngressOnce(c, body, "responses_post")
+		h.submit(c, body, backgroundResponseSubmitOptions{heavyWebSearch: backgroundResponseIsHeavyWebSearch(body)})
 		return true
 	}
-	reqStream, ok := parseOpenAICompatibleStream(body)
-	if !ok || reqStream || !backgroundResponseIsHeavyWebSearch(body) {
-		return false
-	}
-	h.submit(c, body, backgroundResponseSubmitOptions{autoBackground: true, heavyWebSearch: true})
-	return true
+	return false
 }
 
 type backgroundResponseSubmitOptions struct {
@@ -167,6 +268,17 @@ func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte, opts bac
 		backgroundResponseJSONError(c, http.StatusUnauthorized, "authentication_error", "Invalid API key")
 		return
 	}
+	if opts.heavyWebSearch {
+		q := defaultBackgroundResponseHeavyQueue
+		if h.heavyQueue != nil {
+			q = h.heavyQueue
+		}
+		if q != nil && !q.canAcceptWaitingSlot() {
+			c.Header("Retry-After", "3")
+			backgroundResponseJSONError(c, http.StatusTooManyRequests, "proxy_heavy_queue_full", "heavy web search queue is full, please retry later")
+			return
+		}
+	}
 
 	// The gateway itself owns persistence. Do not ask subscription/OAuth
 	// upstreams to implement OpenAI's background lifecycle as well.
@@ -181,6 +293,7 @@ func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte, opts bac
 		return
 	}
 	taskCtx, recorder, cancel := newBackgroundResponseContext(c, executionBody, h.tasks.ExecutionTimeout())
+	taskCtx.Set(responsesInternalBackgroundExecuteKey, true)
 
 	c.Header("Cache-Control", "no-store")
 	c.Header("Location", backgroundResponsePollURL(c.Request.URL.Path, task.ID))
@@ -193,7 +306,8 @@ func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte, opts bac
 	}
 	c.JSON(http.StatusOK, backgroundResponsePendingPayload(task))
 
-	go h.run(task.ID, taskCtx, recorder, cancel, apiKey.UserID, opts)
+	owner := service.BackgroundResponseOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}
+	go h.run(task.ID, taskCtx, recorder, cancel, owner, opts)
 }
 
 func (h *BackgroundResponseHandler) Get(c *gin.Context) {
@@ -201,6 +315,7 @@ func (h *BackgroundResponseHandler) Get(c *gin.Context) {
 		backgroundResponseError(c, service.ErrBackgroundResponseUnavailable)
 		return
 	}
+	recordResponsesIngressOnce(c, nil, "background_poll")
 	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
 	if !ok || apiKey == nil || apiKey.UserID <= 0 || apiKey.ID <= 0 {
 		backgroundResponseJSONError(c, http.StatusUnauthorized, "authentication_error", "Invalid API key")
@@ -217,6 +332,10 @@ func (h *BackgroundResponseHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusOK, backgroundResponsePendingPayload(task))
 		return
 	}
+	if task.Status == service.BackgroundResponseStatusCancelled {
+		c.JSON(http.StatusOK, backgroundResponseCancelledPayload(task))
+		return
+	}
 	if task.Status == service.BackgroundResponseStatusCompleted && len(task.Result) > 0 && json.Valid(task.Result) {
 		result := task.Result
 		result, _ = sjson.SetBytes(result, "id", task.ID)
@@ -227,6 +346,78 @@ func (h *BackgroundResponseHandler) Get(c *gin.Context) {
 	c.JSON(http.StatusOK, backgroundResponseFailedPayload(task))
 }
 
+func (h *BackgroundResponseHandler) Cancel(c *gin.Context) {
+	if h == nil || h.tasks == nil || !h.tasks.Enabled() {
+		backgroundResponseError(c, service.ErrBackgroundResponseUnavailable)
+		return
+	}
+	recordResponsesIngressOnce(c, nil, "background_cancel")
+	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
+	if !ok || apiKey == nil || apiKey.UserID <= 0 || apiKey.ID <= 0 {
+		backgroundResponseJSONError(c, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+		return
+	}
+	responseID := strings.TrimSpace(c.Param("response_id"))
+	if responseID == "" {
+		responseID, _ = backgroundResponseCancelIDFromPath(c)
+	}
+	if cancelAny, ok := h.running.Load(responseID); ok {
+		if cancel, ok := cancelAny.(context.CancelFunc); ok && cancel != nil {
+			cancel()
+		}
+	}
+	task, err := h.tasks.Cancel(c.Request.Context(), service.BackgroundResponseOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}, responseID)
+	if err != nil {
+		backgroundResponseError(c, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	if task.Status == service.BackgroundResponseStatusCompleted && len(task.Result) > 0 && json.Valid(task.Result) {
+		result := task.Result
+		result, _ = sjson.SetBytes(result, "id", task.ID)
+		result, _ = sjson.SetBytes(result, "background", true)
+		c.Data(http.StatusOK, "application/json; charset=utf-8", result)
+		return
+	}
+	if task.Status == service.BackgroundResponseStatusFailed {
+		c.JSON(http.StatusOK, backgroundResponseFailedPayload(task))
+		return
+	}
+	c.JSON(http.StatusOK, backgroundResponseCancelledPayload(task))
+}
+
+func (h *BackgroundResponseHandler) TryCancel(c *gin.Context) bool {
+	if h == nil || c == nil || c.Request == nil || c.Request.Method != http.MethodPost {
+		return false
+	}
+	responseID, ok := backgroundResponseCancelIDFromPath(c)
+	if !ok || responseID == "" {
+		return false
+	}
+	c.Params = append(c.Params, gin.Param{Key: "response_id", Value: responseID})
+	h.Cancel(c)
+	return true
+}
+
+func backgroundResponseCancelIDFromPath(c *gin.Context) (string, bool) {
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return "", false
+	}
+	path := strings.Trim(strings.TrimSpace(c.Request.URL.Path), "/")
+	parts := strings.Split(path, "/")
+	for i := 0; i+2 < len(parts); i++ {
+		if parts[i] != "responses" || parts[i+2] != "cancel" {
+			continue
+		}
+		id := strings.TrimSpace(parts[i+1])
+		if id == "" || !strings.HasPrefix(id, "resp") {
+			return "", false
+		}
+		return id, true
+	}
+	return "", false
+}
+
 func (h *BackgroundResponseHandler) executeWithGateway(c *gin.Context) {
 	if h == nil || h.openAI == nil {
 		backgroundResponseJSONError(c, http.StatusServiceUnavailable, "api_error", "Responses gateway is unavailable")
@@ -235,7 +426,9 @@ func (h *BackgroundResponseHandler) executeWithGateway(c *gin.Context) {
 	h.openAI.Responses(c)
 }
 
-func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, recorder *httptest.ResponseRecorder, cancel context.CancelFunc, userID int64, opts backgroundResponseSubmitOptions) {
+func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, recorder *httptest.ResponseRecorder, cancel context.CancelFunc, owner service.BackgroundResponseOwner, opts backgroundResponseSubmitOptions) {
+	h.running.Store(taskID, cancel)
+	defer h.running.Delete(taskID)
 	defer cancel()
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -244,32 +437,51 @@ func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, rec
 		}
 	}()
 	if opts.heavyWebSearch {
-		release, queueWait, err := h.acquireHeavyWebSearchQueue(taskCtx.Request.Context(), userID)
+		release, queueWait, err := h.acquireHeavyWebSearchQueue(taskCtx.Request.Context(), owner.UserID)
 		if err != nil {
 			logger.L().Warn("background_response.heavy_queue_acquire_failed",
 				zap.String("response_id", taskID),
-				zap.Int64("user_id", userID),
+				zap.Int64("user_id", owner.UserID),
 				zap.Int64("queue_wait_ms", queueWait.Milliseconds()),
 				zap.Error(err),
 			)
+			if errors.Is(err, context.Canceled) {
+				h.cancelTask(taskID)
+				return
+			}
+			if errors.Is(err, errBackgroundHeavyQueueFull) {
+				h.failTask(taskID, http.StatusTooManyRequests, backgroundResponseErrorPayload("proxy_heavy_queue_full", "heavy web search queue is full"))
+				return
+			}
 			h.failTask(taskID, http.StatusServiceUnavailable, backgroundResponseErrorPayload("proxy_heavy_queue_timeout", "heavy web search queue timed out before execution"))
 			return
 		}
 		defer release()
-		taskCtx.Set(backgroundResponseUserSlotWaitTimeoutKey, h.tasks.ExecutionTimeout())
+		taskCtx.Set(responsesSkipUserSlotKey, true)
+		taskCtx.Set(responsesHeavySlotAlreadyAcquiredKey, true)
 		logger.L().Info("background_response.heavy_queue_acquired",
 			zap.String("response_id", taskID),
-			zap.Int64("user_id", userID),
+			zap.Int64("user_id", owner.UserID),
 			zap.Int64("queue_wait_ms", queueWait.Milliseconds()),
 		)
+	}
+	if h.isTaskCancelled(taskID, owner) {
+		return
 	}
 	if err := h.tasks.MarkInProgress(context.Background(), taskID); err != nil {
 		logger.L().Error("background_response.mark_processing_failed", zap.String("response_id", taskID), zap.Error(err))
 	}
+	if h.isTaskCancelled(taskID, owner) {
+		return
+	}
 	h.execute(taskCtx)
 	body := bytes.TrimSpace(recorder.Body.Bytes())
 	if err := taskCtx.Request.Context().Err(); err != nil && len(body) == 0 {
-		h.failTask(taskID, http.StatusGatewayTimeout, backgroundResponseErrorPayload("timeout_error", "background response timed out"))
+		if errors.Is(err, context.Canceled) {
+			h.cancelTask(taskID)
+			return
+		}
+		h.failTask(taskID, http.StatusGatewayTimeout, backgroundResponseErrorPayload("upstream_timeout", "background response timed out"))
 		return
 	}
 	statusCode := recorder.Code
@@ -296,13 +508,36 @@ func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, rec
 		}
 		return
 	}
-	h.failTask(taskID, statusCode, extractBackgroundResponseError(body))
+	h.failTask(taskID, statusCode, classifyBackgroundResponseFailure(statusCode, body, extractBackgroundResponseError(body)))
 }
 
 func (h *BackgroundResponseHandler) failTask(taskID string, statusCode int, taskErr json.RawMessage) {
 	if err := h.tasks.Fail(context.Background(), taskID, statusCode, taskErr); err != nil {
 		logger.L().Error("background_response.failure_store_failed", zap.String("response_id", taskID), zap.Error(err))
 	}
+}
+
+func (h *BackgroundResponseHandler) cancelTask(taskID string) {
+	if h == nil || h.tasks == nil {
+		return
+	}
+	if err := h.tasks.CancelByID(context.Background(), taskID); err == nil {
+		return
+	}
+	// Cancel requires owner for API calls. For internal cancellation we only have
+	// the id in some late failure paths; keep terminal cancellation best-effort by
+	// failing with an explicit type if ownership lookup is unavailable.
+	if failErr := h.tasks.Fail(context.Background(), taskID, statusClientClosedRequest, backgroundResponseErrorPayload("downstream_client_cancelled", "background response cancelled")); failErr != nil {
+		logger.L().Error("background_response.cancel_store_failed", zap.String("response_id", taskID), zap.Error(failErr))
+	}
+}
+
+func (h *BackgroundResponseHandler) isTaskCancelled(taskID string, owner service.BackgroundResponseOwner) bool {
+	if h == nil || h.tasks == nil || !h.tasks.Enabled() {
+		return false
+	}
+	task, err := h.tasks.Get(context.Background(), owner, taskID)
+	return err == nil && task.Status == service.BackgroundResponseStatusCancelled
 }
 
 func normalizeBackgroundResponseExecutionBody(body []byte) ([]byte, error) {
@@ -465,6 +700,21 @@ func backgroundResponseFailedPayload(task *service.BackgroundResponseTaskRecord)
 	}
 }
 
+func backgroundResponseCancelledPayload(task *service.BackgroundResponseTaskRecord) gin.H {
+	return gin.H{
+		"id":                 task.ID,
+		"object":             "response",
+		"created_at":         task.CreatedAt,
+		"status":             service.BackgroundResponseStatusCancelled,
+		"background":         true,
+		"model":              task.Model,
+		"output":             []any{},
+		"error":              nil,
+		"incomplete_details": nil,
+		"usage":              nil,
+	}
+}
+
 func extractBackgroundResponseError(body []byte) json.RawMessage {
 	if json.Valid(body) {
 		var envelope struct {
@@ -476,6 +726,33 @@ func extractBackgroundResponseError(body []byte) json.RawMessage {
 		return json.RawMessage(body)
 	}
 	return backgroundResponseErrorPayload("api_error", "background response failed")
+}
+
+func classifyBackgroundResponseFailure(statusCode int, body []byte, taskErr json.RawMessage) json.RawMessage {
+	bodyText := strings.ToLower(string(body))
+	errText := strings.ToLower(string(taskErr))
+	switch {
+	case statusCode == http.StatusTooManyRequests:
+		return backgroundResponseErrorPayload("upstream_rate_limited", backgroundResponseErrorMessage(taskErr, "upstream rate limited"))
+	case strings.Contains(bodyText, "unexpected eof") || strings.Contains(errText, "unexpected eof"):
+		return backgroundResponseErrorPayload("upstream_unexpected_eof", backgroundResponseErrorMessage(taskErr, "upstream connection closed unexpectedly"))
+	case statusCode == http.StatusGatewayTimeout || strings.Contains(errText, "timeout"):
+		return backgroundResponseErrorPayload("upstream_timeout", backgroundResponseErrorMessage(taskErr, "upstream request timed out"))
+	default:
+		return taskErr
+	}
+}
+
+func backgroundResponseErrorMessage(taskErr json.RawMessage, fallback string) string {
+	if len(taskErr) > 0 && json.Valid(taskErr) {
+		if msg := strings.TrimSpace(gjson.GetBytes(taskErr, "message").String()); msg != "" {
+			return msg
+		}
+		if msg := strings.TrimSpace(gjson.GetBytes(taskErr, "error.message").String()); msg != "" {
+			return msg
+		}
+	}
+	return fallback
 }
 
 func backgroundResponseErrorPayload(errorType, message string) json.RawMessage {

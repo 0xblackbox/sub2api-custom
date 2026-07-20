@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 type backgroundResponseMemoryStore struct {
@@ -43,6 +44,19 @@ func (s *backgroundResponseMemoryStore) Get(_ context.Context, _ string) (*Backg
 	return &copy, nil
 }
 
+func (s *backgroundResponseMemoryStore) ListActive(_ context.Context, limit int) ([]*BackgroundResponseTaskRecord, error) {
+	if s.task == nil {
+		return nil, nil
+	}
+	if s.task.Status != BackgroundResponseStatusQueued && s.task.Status != BackgroundResponseStatusInProgress {
+		return nil, nil
+	}
+	copy := *s.task
+	copy.Result = append(json.RawMessage(nil), s.task.Result...)
+	copy.Error = append(json.RawMessage(nil), s.task.Error...)
+	return []*BackgroundResponseTaskRecord{&copy}[:min(1, max(1, limit))], nil
+}
+
 func TestBackgroundResponseTaskLifecycleAndOwnership(t *testing.T) {
 	store := &backgroundResponseMemoryStore{}
 	svc := NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, 10*time.Minute)
@@ -73,6 +87,42 @@ func TestBackgroundResponseTaskLifecycleAndOwnership(t *testing.T) {
 	require.Equal(t, http.StatusOK, completed.HTTPStatus)
 	require.JSONEq(t, string(result), string(completed.Result))
 	require.NotNil(t, completed.CompletedAt)
+}
+
+func TestBackgroundResponseTaskCancel(t *testing.T) {
+	store := &backgroundResponseMemoryStore{}
+	svc := NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
+	owner := BackgroundResponseOwner{UserID: 7, APIKeyID: 9}
+
+	created, err := svc.Create(context.Background(), owner, "gpt-5.6-sol")
+	require.NoError(t, err)
+	cancelled, err := svc.Cancel(context.Background(), owner, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, BackgroundResponseStatusCancelled, cancelled.Status)
+	require.NotNil(t, cancelled.CompletedAt)
+
+	require.NoError(t, svc.Fail(context.Background(), created.ID, http.StatusBadGateway, json.RawMessage(`{"type":"api_error","message":"late"}`)))
+	got, err := svc.Get(context.Background(), owner, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, BackgroundResponseStatusCancelled, got.Status)
+}
+
+func TestBackgroundResponseTaskFailActiveOnStartup(t *testing.T) {
+	store := &backgroundResponseMemoryStore{}
+	svc := NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
+	owner := BackgroundResponseOwner{UserID: 7, APIKeyID: 9}
+	created, err := svc.Create(context.Background(), owner, "gpt-5.6-sol")
+	require.NoError(t, err)
+	require.NoError(t, svc.MarkInProgress(context.Background(), created.ID))
+
+	failed, err := svc.FailActiveOnStartup(context.Background(), 100)
+	require.NoError(t, err)
+	require.Equal(t, 1, failed)
+
+	got, err := svc.Get(context.Background(), owner, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, BackgroundResponseStatusFailed, got.Status)
+	require.Equal(t, "background_task_failed", gjson.GetBytes(got.Error, "type").String())
 }
 
 func TestBackgroundResponseTaskInvalidResultBecomesFailed(t *testing.T) {

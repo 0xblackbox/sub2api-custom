@@ -43,6 +43,45 @@ func (s *backgroundResponseTaskStore) Get(ctx context.Context, id string) (*serv
 	return &task, nil
 }
 
+func (s *backgroundResponseTaskStore) ListActive(ctx context.Context, limit int) ([]*service.BackgroundResponseTaskRecord, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	var (
+		cursor uint64
+		out    []*service.BackgroundResponseTaskRecord
+	)
+	for {
+		keys, next, err := s.rdb.Scan(ctx, cursor, backgroundResponseTaskKeyPrefix+"*", 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		cursor = next
+		for _, key := range keys {
+			data, err := s.rdb.Get(ctx, key).Bytes()
+			if err != nil {
+				if err == redis.Nil {
+					continue
+				}
+				return nil, err
+			}
+			var task service.BackgroundResponseTaskRecord
+			if err := json.Unmarshal(data, &task); err != nil {
+				continue
+			}
+			if task.Status == service.BackgroundResponseStatusQueued || task.Status == service.BackgroundResponseStatusInProgress {
+				out = append(out, &task)
+				if len(out) >= limit {
+					return out, nil
+				}
+			}
+		}
+		if cursor == 0 {
+			return out, nil
+		}
+	}
+}
+
 func backgroundResponseTaskKey(id string) string {
 	return backgroundResponseTaskKeyPrefix + strings.TrimSpace(id)
 }

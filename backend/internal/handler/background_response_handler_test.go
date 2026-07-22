@@ -789,6 +789,43 @@ func TestBackgroundResponseUnsupportedNativeStreamingCreatedEOFStillPolls(t *tes
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestBackgroundResponseStreamingFallbackPersistsCreatedIDBeforeEOF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	calls := 0
+	releaseStream := make(chan struct{})
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
+	h.execute = func(c *gin.Context) {
+		calls++
+		if calls == 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "Unsupported parameter: background"})
+			return
+		}
+		c.Header("Content-Type", "text/event-stream")
+		_, _ = c.Writer.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_up_persisted","status":"in_progress"}}` + "\n\n"))
+		if flusher, ok := c.Writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-releaseStream
+	}
+	h.fetchUpstream = func(_ context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error) {
+		require.Equal(t, "resp_up_persisted", task.UpstreamResponseID)
+		return &backgroundUpstreamPollResult{statusCode: http.StatusOK, body: []byte(`{"id":"resp_up_persisted","object":"response","status":"completed","model":"gpt-5.6-sol","output":[]}`)}, nil
+	}
+
+	id := submitHeavyBackgroundForTest(t, backgroundResponseTestRouter(h))
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
+		return err == nil && got.UpstreamResponseID == "resp_up_persisted" && got.Status == service.BackgroundResponseStatusInProgress
+	}, time.Second, 10*time.Millisecond)
+	close(releaseStream)
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
+		return err == nil && got.Status == service.BackgroundResponseStatusCompleted
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestBackgroundResponseEOFBeforeIDRetriesWithSameIdempotencyKey(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}

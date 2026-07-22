@@ -700,6 +700,21 @@ func (h *BackgroundResponseHandler) executeStreamingBackgroundFallback(taskID st
 		return false
 	}
 	fallbackCtx, fallbackRecorder := cloneBackgroundResponseExecutionContextWithBody(baseCtx, body)
+	fallbackCtx.Writer = newBackgroundResponseCreatedCaptureWriter(fallbackCtx.Writer, func(upstreamID string) {
+		accountID, _ := fallbackCtx.Request.Context().Value(ctxkey.AccountID).(int64)
+		if err := h.tasks.AttachUpstream(context.Background(), taskID, accountID, upstreamID, ""); err != nil {
+			logger.L().Error("background_response.attach_upstream_from_stream_created_failed",
+				zap.String("response_id", taskID),
+				zap.String("upstream_response_id", upstreamID),
+				zap.Error(err),
+			)
+			return
+		}
+		logger.L().Info("background_response.streaming_created_persisted",
+			zap.String("response_id", taskID),
+			zap.String("upstream_response_id", upstreamID),
+		)
+	})
 	statusCode, responseBody, upstreamRequestID, _, accountID := h.executeNativeBackgroundCreate(fallbackCtx, fallbackRecorder)
 	if accountID > 0 || upstreamRequestID != "" {
 		_ = h.tasks.AttachUpstream(context.Background(), taskID, accountID, "", upstreamRequestID)
@@ -1282,6 +1297,77 @@ func backgroundResponseUpstreamIDFromSSE(body []byte) string {
 		}
 	})
 	return upstreamID
+}
+
+func backgroundResponseUpstreamActiveIDFromSSE(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	upstreamID := ""
+	backgroundResponseForEachSSEDataPayload(body, func(data []byte) {
+		if upstreamID != "" || len(data) == 0 || !gjson.ValidBytes(data) {
+			return
+		}
+		switch strings.TrimSpace(gjson.GetBytes(data, "type").String()) {
+		case "response.created", "response.queued", "response.in_progress":
+			upstreamID = strings.TrimSpace(gjson.GetBytes(data, "response.id").String())
+		}
+		if upstreamID == "" {
+			status := strings.ToLower(strings.TrimSpace(gjson.GetBytes(data, "status").String()))
+			if status == service.BackgroundResponseStatusQueued || status == service.BackgroundResponseStatusInProgress {
+				upstreamID = strings.TrimSpace(gjson.GetBytes(data, "id").String())
+			}
+		}
+	})
+	return upstreamID
+}
+
+type backgroundResponseCreatedCaptureWriter struct {
+	gin.ResponseWriter
+	mu        sync.Mutex
+	buffer    bytes.Buffer
+	once      sync.Once
+	onCreated func(string)
+}
+
+func newBackgroundResponseCreatedCaptureWriter(w gin.ResponseWriter, onCreated func(string)) *backgroundResponseCreatedCaptureWriter {
+	return &backgroundResponseCreatedCaptureWriter{
+		ResponseWriter: w,
+		onCreated:      onCreated,
+	}
+}
+
+func (w *backgroundResponseCreatedCaptureWriter) Write(data []byte) (int, error) {
+	w.observe(data)
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *backgroundResponseCreatedCaptureWriter) WriteString(s string) (int, error) {
+	w.observe([]byte(s))
+	return w.ResponseWriter.WriteString(s)
+}
+
+func (w *backgroundResponseCreatedCaptureWriter) observe(data []byte) {
+	if w == nil || len(data) == 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	const maxCaptureBytes = 1 << 20
+	if w.buffer.Len() < maxCaptureBytes {
+		remaining := maxCaptureBytes - w.buffer.Len()
+		if len(data) > remaining {
+			data = data[:remaining]
+		}
+		_, _ = w.buffer.Write(data)
+	}
+	if upstreamID := backgroundResponseUpstreamActiveIDFromSSE(w.buffer.Bytes()); upstreamID != "" {
+		w.once.Do(func() {
+			if w.onCreated != nil {
+				w.onCreated(upstreamID)
+			}
+		})
+	}
 }
 
 func newBackgroundResponseContext(c *gin.Context, body []byte, timeoutDuration time.Duration) (*gin.Context, *httptest.ResponseRecorder, context.CancelFunc) {

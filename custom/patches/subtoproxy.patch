@@ -126,10 +126,10 @@ index fabee82d8..c615302bc 100644
  	repo.mu.Lock()
 diff --git a/backend/internal/handler/background_response_handler.go b/backend/internal/handler/background_response_handler.go
 new file mode 100644
-index 000000000..868e59a9b
+index 000000000..8ee976143
 --- /dev/null
 +++ b/backend/internal/handler/background_response_handler.go
-@@ -0,0 +1,1869 @@
+@@ -0,0 +1,1955 @@
 +package handler
 +
 +import (
@@ -832,6 +832,21 @@ index 000000000..868e59a9b
 +		return false
 +	}
 +	fallbackCtx, fallbackRecorder := cloneBackgroundResponseExecutionContextWithBody(baseCtx, body)
++	fallbackCtx.Writer = newBackgroundResponseCreatedCaptureWriter(fallbackCtx.Writer, func(upstreamID string) {
++		accountID, _ := fallbackCtx.Request.Context().Value(ctxkey.AccountID).(int64)
++		if err := h.tasks.AttachUpstream(context.Background(), taskID, accountID, upstreamID, ""); err != nil {
++			logger.L().Error("background_response.attach_upstream_from_stream_created_failed",
++				zap.String("response_id", taskID),
++				zap.String("upstream_response_id", upstreamID),
++				zap.Error(err),
++			)
++			return
++		}
++		logger.L().Info("background_response.streaming_created_persisted",
++			zap.String("response_id", taskID),
++			zap.String("upstream_response_id", upstreamID),
++		)
++	})
 +	statusCode, responseBody, upstreamRequestID, _, accountID := h.executeNativeBackgroundCreate(fallbackCtx, fallbackRecorder)
 +	if accountID > 0 || upstreamRequestID != "" {
 +		_ = h.tasks.AttachUpstream(context.Background(), taskID, accountID, "", upstreamRequestID)
@@ -1414,6 +1429,77 @@ index 000000000..868e59a9b
 +		}
 +	})
 +	return upstreamID
++}
++
++func backgroundResponseUpstreamActiveIDFromSSE(body []byte) string {
++	if len(body) == 0 {
++		return ""
++	}
++	upstreamID := ""
++	backgroundResponseForEachSSEDataPayload(body, func(data []byte) {
++		if upstreamID != "" || len(data) == 0 || !gjson.ValidBytes(data) {
++			return
++		}
++		switch strings.TrimSpace(gjson.GetBytes(data, "type").String()) {
++		case "response.created", "response.queued", "response.in_progress":
++			upstreamID = strings.TrimSpace(gjson.GetBytes(data, "response.id").String())
++		}
++		if upstreamID == "" {
++			status := strings.ToLower(strings.TrimSpace(gjson.GetBytes(data, "status").String()))
++			if status == service.BackgroundResponseStatusQueued || status == service.BackgroundResponseStatusInProgress {
++				upstreamID = strings.TrimSpace(gjson.GetBytes(data, "id").String())
++			}
++		}
++	})
++	return upstreamID
++}
++
++type backgroundResponseCreatedCaptureWriter struct {
++	gin.ResponseWriter
++	mu        sync.Mutex
++	buffer    bytes.Buffer
++	once      sync.Once
++	onCreated func(string)
++}
++
++func newBackgroundResponseCreatedCaptureWriter(w gin.ResponseWriter, onCreated func(string)) *backgroundResponseCreatedCaptureWriter {
++	return &backgroundResponseCreatedCaptureWriter{
++		ResponseWriter: w,
++		onCreated:      onCreated,
++	}
++}
++
++func (w *backgroundResponseCreatedCaptureWriter) Write(data []byte) (int, error) {
++	w.observe(data)
++	return w.ResponseWriter.Write(data)
++}
++
++func (w *backgroundResponseCreatedCaptureWriter) WriteString(s string) (int, error) {
++	w.observe([]byte(s))
++	return w.ResponseWriter.WriteString(s)
++}
++
++func (w *backgroundResponseCreatedCaptureWriter) observe(data []byte) {
++	if w == nil || len(data) == 0 {
++		return
++	}
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	const maxCaptureBytes = 1 << 20
++	if w.buffer.Len() < maxCaptureBytes {
++		remaining := maxCaptureBytes - w.buffer.Len()
++		if len(data) > remaining {
++			data = data[:remaining]
++		}
++		_, _ = w.buffer.Write(data)
++	}
++	if upstreamID := backgroundResponseUpstreamActiveIDFromSSE(w.buffer.Bytes()); upstreamID != "" {
++		w.once.Do(func() {
++			if w.onCreated != nil {
++				w.onCreated(upstreamID)
++			}
++		})
++	}
 +}
 +
 +func newBackgroundResponseContext(c *gin.Context, body []byte, timeoutDuration time.Duration) (*gin.Context, *httptest.ResponseRecorder, context.CancelFunc) {
@@ -2001,10 +2087,10 @@ index 000000000..868e59a9b
 +}
 diff --git a/backend/internal/handler/background_response_handler_test.go b/backend/internal/handler/background_response_handler_test.go
 new file mode 100644
-index 000000000..ba7058cbc
+index 000000000..93cbb414c
 --- /dev/null
 +++ b/backend/internal/handler/background_response_handler_test.go
-@@ -0,0 +1,940 @@
+@@ -0,0 +1,977 @@
 +package handler
 +
 +import (
@@ -2793,6 +2879,43 @@ index 000000000..ba7058cbc
 +	require.Eventually(t, func() bool {
 +		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
 +		return err == nil && got.Status == service.BackgroundResponseStatusCompleted && got.UpstreamResponseID == "resp_up_stream_recover"
++	}, time.Second, 10*time.Millisecond)
++}
++
++func TestBackgroundResponseStreamingFallbackPersistsCreatedIDBeforeEOF(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
++	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
++	calls := 0
++	releaseStream := make(chan struct{})
++	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
++	h.execute = func(c *gin.Context) {
++		calls++
++		if calls == 1 {
++			c.JSON(http.StatusBadRequest, gin.H{"detail": "Unsupported parameter: background"})
++			return
++		}
++		c.Header("Content-Type", "text/event-stream")
++		_, _ = c.Writer.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_up_persisted","status":"in_progress"}}` + "\n\n"))
++		if flusher, ok := c.Writer.(http.Flusher); ok {
++			flusher.Flush()
++		}
++		<-releaseStream
++	}
++	h.fetchUpstream = func(_ context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error) {
++		require.Equal(t, "resp_up_persisted", task.UpstreamResponseID)
++		return &backgroundUpstreamPollResult{statusCode: http.StatusOK, body: []byte(`{"id":"resp_up_persisted","object":"response","status":"completed","model":"gpt-5.6-sol","output":[]}`)}, nil
++	}
++
++	id := submitHeavyBackgroundForTest(t, backgroundResponseTestRouter(h))
++	require.Eventually(t, func() bool {
++		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
++		return err == nil && got.UpstreamResponseID == "resp_up_persisted" && got.Status == service.BackgroundResponseStatusInProgress
++	}, time.Second, 10*time.Millisecond)
++	close(releaseStream)
++	require.Eventually(t, func() bool {
++		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
++		return err == nil && got.Status == service.BackgroundResponseStatusCompleted
 +	}, time.Second, 10*time.Millisecond)
 +}
 +

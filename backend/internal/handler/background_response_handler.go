@@ -555,7 +555,13 @@ func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, rec
 	if h.handleNativeBackgroundCreateResult(taskID, owner, createStatus, createBody, accountID, upstreamRequestID) {
 		return
 	}
-	if backgroundResponseNativeBackgroundUnsupported(createStatus, createBody) {
+	if backgroundResponseNativeBackgroundUnsupportedFromContext(taskCtx, createStatus, createBody) {
+		logger.L().Warn("background_response.native_background_unsupported_fallback",
+			zap.String("response_id", taskID),
+			zap.Int("client_status", createStatus),
+			zap.Int("upstream_status", backgroundResponseUpstreamStatusFromContext(taskCtx)),
+			zap.String("upstream_message", backgroundResponseUpstreamMessageFromContext(taskCtx)),
+		)
 		if h.executeStreamingBackgroundFallback(taskID, owner, taskCtx, streamingFallbackBody, true) {
 			return
 		}
@@ -595,7 +601,7 @@ func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, rec
 		createStatus, createBody, upstreamRequestID, createRetryAfter, accountID = retryStatus, retryBody, retryRequestID, retryRetryAfter, retryAccountID
 	}
 
-	h.failTask(taskID, createStatus, backgroundResponseAttachRetryAfter(classifyBackgroundResponseFailure(createStatus, createBody, extractBackgroundResponseError(createBody)), createRetryAfter))
+	h.failTask(taskID, createStatus, backgroundResponseAttachRetryAfter(classifyBackgroundResponseFailureFromContext(taskCtx, createStatus, createBody, extractBackgroundResponseError(createBody)), createRetryAfter))
 }
 
 func (h *BackgroundResponseHandler) failTask(taskID string, statusCode int, taskErr json.RawMessage) {
@@ -717,13 +723,13 @@ func (h *BackgroundResponseHandler) executeStreamingBackgroundFallback(taskID st
 		h.pollNativeBackground(taskID, owner)
 		return true
 	}
-	if allowStoreFalseRetry && backgroundResponseStreamingStoreUnsupported(statusCode, responseBody) {
+	if allowStoreFalseRetry && backgroundResponseStreamingStoreUnsupportedFromContext(fallbackCtx, statusCode, responseBody) {
 		if original, err := normalizeBackgroundResponseStreamingFallbackBody(body, false); err == nil {
 			logger.L().Warn("background_response.streaming_fallback_store_true_unsupported", zap.String("response_id", taskID))
 			return h.executeStreamingBackgroundFallback(taskID, owner, baseCtx, original, false)
 		}
 	}
-	h.failTask(taskID, statusCode, classifyBackgroundResponseFailure(statusCode, responseBody, extractBackgroundResponseError(responseBody)))
+	h.failTask(taskID, statusCode, classifyBackgroundResponseFailureFromContext(fallbackCtx, statusCode, responseBody, extractBackgroundResponseError(responseBody)))
 	return true
 }
 
@@ -935,16 +941,100 @@ func backgroundResponseNativeBackgroundUnsupported(statusCode int, body []byte) 
 	if statusCode != http.StatusBadRequest {
 		return false
 	}
-	text := strings.ToLower(string(body))
-	return strings.Contains(text, "unsupported parameter") && strings.Contains(text, "background")
+	return backgroundResponseTextHasUnsupportedParameter(string(body), "background")
+}
+
+func backgroundResponseNativeBackgroundUnsupportedFromContext(c *gin.Context, statusCode int, body []byte) bool {
+	if backgroundResponseNativeBackgroundUnsupported(statusCode, body) {
+		return true
+	}
+	upstreamStatus := backgroundResponseUpstreamStatusFromContext(c)
+	if upstreamStatus != http.StatusBadRequest {
+		return false
+	}
+	return backgroundResponseTextHasUnsupportedParameter(backgroundResponseUpstreamErrorTextFromContext(c, body), "background")
 }
 
 func backgroundResponseStreamingStoreUnsupported(statusCode int, body []byte) bool {
 	if statusCode != http.StatusBadRequest {
 		return false
 	}
-	text := strings.ToLower(string(body))
-	return strings.Contains(text, "unsupported parameter") && strings.Contains(text, "store")
+	return backgroundResponseTextHasUnsupportedParameter(string(body), "store")
+}
+
+func backgroundResponseStreamingStoreUnsupportedFromContext(c *gin.Context, statusCode int, body []byte) bool {
+	if backgroundResponseStreamingStoreUnsupported(statusCode, body) {
+		return true
+	}
+	upstreamStatus := backgroundResponseUpstreamStatusFromContext(c)
+	if upstreamStatus != http.StatusBadRequest {
+		return false
+	}
+	return backgroundResponseTextHasUnsupportedParameter(backgroundResponseUpstreamErrorTextFromContext(c, body), "store")
+}
+
+func backgroundResponseTextHasUnsupportedParameter(text, param string) bool {
+	text = strings.ToLower(text)
+	param = strings.ToLower(strings.TrimSpace(param))
+	if text == "" || param == "" || !strings.Contains(text, param) {
+		return false
+	}
+	return strings.Contains(text, "unsupported parameter") ||
+		strings.Contains(text, "unknown parameter") ||
+		strings.Contains(text, "unrecognized parameter") ||
+		strings.Contains(text, "unsupported request parameter")
+}
+
+func backgroundResponseUpstreamStatusFromContext(c *gin.Context) int {
+	if c == nil {
+		return 0
+	}
+	raw, ok := c.Get(service.OpsUpstreamStatusCodeKey)
+	if !ok {
+		return 0
+	}
+	switch v := raw.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(v))
+		return n
+	default:
+		return 0
+	}
+}
+
+func backgroundResponseUpstreamMessageFromContext(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	raw, ok := c.Get(service.OpsUpstreamErrorMessageKey)
+	if !ok {
+		return ""
+	}
+	msg, _ := raw.(string)
+	return strings.TrimSpace(msg)
+}
+
+func backgroundResponseUpstreamDetailFromContext(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	raw, ok := c.Get(service.OpsUpstreamErrorDetailKey)
+	if !ok {
+		return ""
+	}
+	detail, _ := raw.(string)
+	return strings.TrimSpace(detail)
+}
+
+func backgroundResponseUpstreamErrorTextFromContext(c *gin.Context, body []byte) string {
+	parts := []string{string(body), backgroundResponseUpstreamMessageFromContext(c), backgroundResponseUpstreamDetailFromContext(c)}
+	return strings.Join(parts, "\n")
 }
 
 func backgroundResponseIsHeavyWebSearch(body []byte) bool {
@@ -1306,6 +1396,33 @@ func classifyBackgroundResponseFailure(statusCode int, body []byte, taskErr json
 		return backgroundResponseErrorPayload("upstream_timeout", backgroundResponseErrorMessage(taskErr, "upstream request timed out"))
 	default:
 		return taskErr
+	}
+}
+
+func classifyBackgroundResponseFailureFromContext(c *gin.Context, statusCode int, body []byte, taskErr json.RawMessage) json.RawMessage {
+	upstreamStatus := backgroundResponseUpstreamStatusFromContext(c)
+	upstreamText := backgroundResponseUpstreamErrorTextFromContext(c, body)
+	upstreamMessage := backgroundResponseUpstreamMessageFromContext(c)
+	if upstreamMessage == "" {
+		upstreamMessage = backgroundResponseErrorMessage(taskErr, "upstream request failed")
+	}
+	syntheticErr := taskErr
+	if upstreamMessage != "" {
+		syntheticErr = backgroundResponseErrorPayload("upstream_error", upstreamMessage)
+	}
+	switch {
+	case upstreamStatus == http.StatusTooManyRequests:
+		return backgroundResponseErrorPayload("upstream_rate_limited", upstreamMessage)
+	case strings.Contains(strings.ToLower(upstreamText), "connection reset") || strings.Contains(strings.ToLower(upstreamText), "reset by peer"):
+		return backgroundResponseErrorPayload("upstream_connection_reset", upstreamMessage)
+	case strings.Contains(strings.ToLower(upstreamText), "unexpected eof"):
+		return backgroundResponseErrorPayload("upstream_unexpected_eof", upstreamMessage)
+	case upstreamStatus == http.StatusGatewayTimeout || strings.Contains(strings.ToLower(upstreamText), "timeout"):
+		return backgroundResponseErrorPayload("upstream_timeout", upstreamMessage)
+	case upstreamStatus > 0 && statusCode >= http.StatusBadGateway:
+		return backgroundResponseErrorPayload("upstream_background_failed", upstreamMessage)
+	default:
+		return classifyBackgroundResponseFailure(statusCode, body, syntheticErr)
 	}
 }
 

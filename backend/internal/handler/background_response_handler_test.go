@@ -696,6 +696,72 @@ func TestBackgroundResponseUnsupportedNativeBackgroundFallsBackToStreamingStoreT
 	require.True(t, gjson.GetBytes(bodies[0], "background").Bool())
 }
 
+func TestBackgroundResponseUnsupportedNativeBackgroundFromMappedGatewayErrorFallsBackToStreaming(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	var bodies [][]byte
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
+	h.execute = func(c *gin.Context) {
+		body, err := io.ReadAll(c.Request.Body)
+		require.NoError(t, err)
+		bodies = append(bodies, append([]byte(nil), body...))
+		if len(bodies) == 1 {
+			service.SetOpsUpstreamError(c, http.StatusBadRequest, "Unsupported parameter: background", `{"detail":"Unsupported parameter: background"}`)
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "upstream_error", "message": "Upstream request failed"}})
+			return
+		}
+		require.False(t, gjson.GetBytes(body, "background").Exists())
+		require.True(t, gjson.GetBytes(body, "stream").Bool())
+		require.True(t, gjson.GetBytes(body, "store").Bool())
+		c.Header("Content-Type", "text/event-stream")
+		_, _ = c.Writer.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_up_stream","object":"response","status":"completed","model":"gpt-5.6-sol","output":[{"type":"web_search_call","status":"completed","action":{"sources":[{"type":"url","url":"https://example.test","title":"Example"}]}}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}` + "\n\n"))
+	}
+
+	id := submitHeavyBackgroundForTest(t, backgroundResponseTestRouter(h))
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
+		return err == nil && got.Status == service.BackgroundResponseStatusCompleted && gjson.GetBytes(got.Result, "output.0.action.sources.0.url").String() == "https://example.test"
+	}, time.Second, 10*time.Millisecond)
+	require.Len(t, bodies, 2)
+	require.True(t, gjson.GetBytes(bodies[0], "background").Bool())
+}
+
+func TestBackgroundResponseStreamingStoreUnsupportedFromMappedGatewayErrorRetriesStoreFalse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	var bodies [][]byte
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
+	h.execute = func(c *gin.Context) {
+		body, err := io.ReadAll(c.Request.Body)
+		require.NoError(t, err)
+		bodies = append(bodies, append([]byte(nil), body...))
+		switch len(bodies) {
+		case 1:
+			service.SetOpsUpstreamError(c, http.StatusBadRequest, "Unsupported parameter: background", `{"detail":"Unsupported parameter: background"}`)
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "upstream_error", "message": "Upstream request failed"}})
+		case 2:
+			require.True(t, gjson.GetBytes(body, "store").Bool())
+			service.SetOpsUpstreamError(c, http.StatusBadRequest, "Unsupported parameter: store", `{"detail":"Unsupported parameter: store"}`)
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "upstream_error", "message": "Upstream request failed"}})
+		default:
+			require.False(t, gjson.GetBytes(body, "background").Exists())
+			require.True(t, gjson.GetBytes(body, "stream").Bool())
+			require.False(t, gjson.GetBytes(body, "store").Bool())
+			c.Header("Content-Type", "text/event-stream")
+			_, _ = c.Writer.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_up_stream","object":"response","status":"completed","model":"gpt-5.6-sol","output":[]}}` + "\n\n"))
+		}
+	}
+
+	id := submitHeavyBackgroundForTest(t, backgroundResponseTestRouter(h))
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
+		return err == nil && got.Status == service.BackgroundResponseStatusCompleted
+	}, time.Second, 10*time.Millisecond)
+	require.Len(t, bodies, 3)
+}
+
 func TestBackgroundResponseUnsupportedNativeStreamingCreatedEOFStillPolls(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}

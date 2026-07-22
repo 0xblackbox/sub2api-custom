@@ -51,7 +51,7 @@ jobs:
             revision=2
           fi
           if [[ "$official_version" == "0.1.163" ]]; then
-            revision=3
+            revision=4
           fi
           custom_version="${official_version}-custom.${revision}"
           custom_tag="v${custom_version}"
@@ -148,4 +148,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$CUSTOM_TAG (SubtoProxy safe channel)" \
-            --notes "Based on official ${OFFICIAL_TAG}. Includes the SubtoProxy native Responses background polling layer, OAuth upstream fallback recovery, heavy Web Search queue isolation, custom-only updater, checksum verification, tests, and one-click automatic restart."
+            --notes "Based on official ${OFFICIAL_TAG}. Includes the SubtoProxy native Responses background polling layer, OAuth SSE-created polling recovery, heavy Web Search queue isolation, custom-only updater, checksum verification, tests, and one-click automatic restart."

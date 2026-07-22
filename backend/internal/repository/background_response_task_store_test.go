@@ -73,3 +73,26 @@ func TestBackgroundResponseTaskStoreListActive(t *testing.T) {
 	require.Len(t, active, 1)
 	require.Equal(t, "resp_bg_active", active[0].ID)
 }
+
+func TestBackgroundResponseTaskStoreIdempotencyReservation(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	store := NewBackgroundResponseTaskStore(rdb)
+	owner := service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}
+
+	existing, reserved, err := store.ReserveIdempotency(context.Background(), owner, "hash", "resp_bg_1", time.Hour)
+	require.NoError(t, err)
+	require.True(t, reserved)
+	require.Empty(t, existing)
+
+	existing, reserved, err = store.ReserveIdempotency(context.Background(), owner, "hash", "resp_bg_2", time.Hour)
+	require.NoError(t, err)
+	require.False(t, reserved)
+	require.Equal(t, "resp_bg_1", existing)
+
+	require.NoError(t, store.ReleaseIdempotency(context.Background(), owner, "hash", "resp_bg_1"))
+	_, reserved, err = store.ReserveIdempotency(context.Background(), owner, "hash", "resp_bg_2", time.Hour)
+	require.NoError(t, err)
+	require.True(t, reserved)
+}

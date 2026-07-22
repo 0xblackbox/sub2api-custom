@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,8 +21,9 @@ import (
 )
 
 type backgroundResponseHandlerMemoryStore struct {
-	mu    sync.RWMutex
-	tasks map[string]*service.BackgroundResponseTaskRecord
+	mu            sync.RWMutex
+	tasks         map[string]*service.BackgroundResponseTaskRecord
+	idempotencies map[string]string
 }
 
 func (s *backgroundResponseHandlerMemoryStore) Save(_ context.Context, task *service.BackgroundResponseTaskRecord, _ time.Duration) error {
@@ -66,6 +68,40 @@ func (s *backgroundResponseHandlerMemoryStore) ListActive(_ context.Context, lim
 	return out, nil
 }
 
+func (s *backgroundResponseHandlerMemoryStore) ReserveIdempotency(_ context.Context, owner service.BackgroundResponseOwner, keyHash, taskID string, _ time.Duration) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if keyHash == "" || taskID == "" {
+		return "", true, nil
+	}
+	if s.idempotencies == nil {
+		s.idempotencies = make(map[string]string)
+	}
+	key := backgroundResponseHandlerMemoryIdempotencyKey(owner, keyHash)
+	if existing := s.idempotencies[key]; existing != "" {
+		return existing, false, nil
+	}
+	s.idempotencies[key] = taskID
+	return "", true, nil
+}
+
+func (s *backgroundResponseHandlerMemoryStore) ReleaseIdempotency(_ context.Context, owner service.BackgroundResponseOwner, keyHash, taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idempotencies == nil {
+		return nil
+	}
+	key := backgroundResponseHandlerMemoryIdempotencyKey(owner, keyHash)
+	if s.idempotencies[key] == taskID {
+		delete(s.idempotencies, key)
+	}
+	return nil
+}
+
+func backgroundResponseHandlerMemoryIdempotencyKey(owner service.BackgroundResponseOwner, keyHash string) string {
+	return strconv.FormatInt(owner.UserID, 10) + ":" + strconv.FormatInt(owner.APIKeyID, 10) + ":" + strings.TrimSpace(keyHash)
+}
+
 func TestBackgroundResponseSubmitSurvivesDisconnectAndPollsFinalResult(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
@@ -75,9 +111,9 @@ func TestBackgroundResponseSubmitSurvivesDisconnectAndPollsFinalResult(t *testin
 	h.execute = func(c *gin.Context) {
 		body, err := io.ReadAll(c.Request.Body)
 		require.NoError(t, err)
-		require.False(t, jsonPathBool(body, "background"))
-		require.True(t, jsonPathBool(body, "stream"))
-		require.False(t, jsonPathBool(body, "store"))
+		require.True(t, jsonPathBool(body, "background"))
+		require.False(t, jsonPathBool(body, "stream"))
+		require.True(t, jsonPathBool(body, "store"))
 		<-release
 		c.Header("Content-Type", "text/event-stream")
 		_, _ = c.Writer.Write([]byte("event: response.output_text.delta\n"))
@@ -373,9 +409,9 @@ func TestBackgroundResponseSubmitHeavyWebSearchBackgroundRequest(t *testing.T) {
 			return false
 		}
 	}, time.Second, 10*time.Millisecond)
-	require.False(t, gjson.GetBytes(executionBody, "background").Exists())
-	require.True(t, gjson.GetBytes(executionBody, "stream").Bool())
-	require.False(t, gjson.GetBytes(executionBody, "store").Bool())
+	require.True(t, gjson.GetBytes(executionBody, "background").Bool())
+	require.False(t, gjson.GetBytes(executionBody, "stream").Bool())
+	require.True(t, gjson.GetBytes(executionBody, "store").Bool())
 	require.Equal(t, "web_search", gjson.GetBytes(executionBody, "tools.0.type").String())
 	require.Equal(t, "high", gjson.GetBytes(executionBody, "tools.0.search_context_size").String())
 	require.Equal(t, "required", gjson.GetBytes(executionBody, "tool_choice").String())
@@ -564,6 +600,174 @@ func TestBackgroundResponseFailureClassification(t *testing.T) {
 
 	eof := classifyBackgroundResponseFailure(http.StatusBadGateway, []byte("unexpected EOF"), backgroundResponseErrorPayload("api_error", "unexpected EOF"))
 	require.Equal(t, "upstream_unexpected_eof", gjson.GetBytes(eof, "type").String())
+
+	reset := classifyBackgroundResponseFailure(http.StatusBadGateway, []byte("connection reset by peer"), backgroundResponseErrorPayload("api_error", "connection reset by peer"))
+	require.Equal(t, "upstream_connection_reset", gjson.GetBytes(reset, "type").String())
+
+	deadline := classifyBackgroundResponseFailure(http.StatusGatewayTimeout, []byte("context deadline exceeded"), backgroundResponseErrorPayload("api_error", "context deadline exceeded"))
+	require.Equal(t, "proxy_task_deadline_exceeded", gjson.GetBytes(deadline, "type").String())
+}
+
+func TestBackgroundResponseNativeCreatePollsPastNineHundredSeconds(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	allowPoll := make(chan struct{})
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
+	h.execute = func(c *gin.Context) {
+		body, err := io.ReadAll(c.Request.Body)
+		require.NoError(t, err)
+		require.True(t, gjson.GetBytes(body, "background").Bool())
+		require.True(t, gjson.GetBytes(body, "store").Bool())
+		require.False(t, gjson.GetBytes(body, "stream").Bool())
+		c.Header("x-request-id", "req_create")
+		c.JSON(http.StatusOK, gin.H{"id": "resp_up_long", "object": "response", "status": service.BackgroundResponseStatusInProgress, "model": "gpt-5.6-sol"})
+	}
+	h.fetchUpstream = func(ctx context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error) {
+		select {
+		case <-allowPoll:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &backgroundUpstreamPollResult{statusCode: http.StatusOK, upstreamRequestID: "req_poll", body: []byte(`{"id":"resp_up_long","object":"response","status":"completed","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`)}, nil
+	}
+
+	router := backgroundResponseTestRouter(h)
+	id := submitHeavyBackgroundForTest(t, router)
+	store.mu.Lock()
+	store.tasks[id].CreatedAt = time.Now().Add(-1100 * time.Second).UTC().Unix()
+	store.mu.Unlock()
+	close(allowPoll)
+
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
+		return err == nil && got.Status == service.BackgroundResponseStatusCompleted && got.ElapsedSeconds >= 1100
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestBackgroundResponseSSECreatedEOFRecoversByPolling(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
+	h.execute = func(c *gin.Context) {
+		c.Status(http.StatusBadGateway)
+		_, _ = c.Writer.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_up_recover","status":"in_progress"}}` + "\n\nunexpected EOF"))
+	}
+	h.fetchUpstream = func(_ context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error) {
+		require.Equal(t, "resp_up_recover", task.UpstreamResponseID)
+		return &backgroundUpstreamPollResult{statusCode: http.StatusOK, body: []byte(`{"id":"resp_up_recover","object":"response","status":"completed","model":"gpt-5.6-sol","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`)}, nil
+	}
+
+	id := submitHeavyBackgroundForTest(t, backgroundResponseTestRouter(h))
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
+		return err == nil && got.Status == service.BackgroundResponseStatusCompleted && got.UpstreamResponseID == "resp_up_recover"
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestBackgroundResponseEOFBeforeIDRetriesWithSameIdempotencyKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	var seenKeys []string
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
+	h.execute = func(c *gin.Context) {
+		seenKeys = append(seenKeys, c.GetHeader("Idempotency-Key"))
+		if len(seenKeys) == 1 {
+			c.Status(http.StatusBadGateway)
+			_, _ = c.Writer.Write([]byte("unexpected EOF"))
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"id": "resp_up_retry", "object": "response", "status": service.BackgroundResponseStatusInProgress})
+	}
+	h.fetchUpstream = func(_ context.Context, _ *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error) {
+		return &backgroundUpstreamPollResult{statusCode: http.StatusOK, body: []byte(`{"id":"resp_up_retry","object":"response","status":"completed","model":"gpt-5.6-sol","output":[]}`)}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchBackgroundRequestBody()))
+	req.Header.Set("Idempotency-Key", "same-key")
+	w := httptest.NewRecorder()
+	backgroundResponseTestRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Eventually(t, func() bool { return len(seenKeys) == 2 }, time.Second, 10*time.Millisecond)
+	require.Equal(t, []string{"same-key", "same-key"}, seenKeys)
+}
+
+func TestBackgroundResponseStartupRecoveryPollsMappedUpstreamTask(t *testing.T) {
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	now := time.Now().UTC().Unix()
+	task := &service.BackgroundResponseTaskRecord{ID: "resp_bg_restart", UserID: 7, APIKeyID: 9, Model: "gpt-5.6-sol", Status: service.BackgroundResponseStatusInProgress, CreatedAt: now, ExpiresAt: now + 3600, UpstreamAccountID: 123, UpstreamResponseID: "resp_up_restart"}
+	require.NoError(t, store.Save(context.Background(), task, time.Hour))
+	h := &BackgroundResponseHandler{tasks: tasks, pollInterval: time.Millisecond}
+	h.fetchUpstream = func(_ context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error) {
+		require.Equal(t, "resp_up_restart", task.UpstreamResponseID)
+		return &backgroundUpstreamPollResult{statusCode: http.StatusOK, body: []byte(`{"id":"resp_up_restart","object":"response","status":"completed","model":"gpt-5.6-sol","output":[]}`)}, nil
+	}
+	h.resumePolling(task)
+	got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, task.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.BackgroundResponseStatusCompleted, got.Status)
+}
+
+func TestBackgroundResponseCreate429StoresClassifiedAuditedFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
+	h.execute = func(c *gin.Context) {
+		c.Header("x-request-id", "req_429")
+		c.Header("Retry-After", "12")
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": gin.H{"type": "rate_limit_error", "message": "slow down"}})
+	}
+	id := submitHeavyBackgroundForTest(t, backgroundResponseTestRouter(h))
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
+		return err == nil && got.Status == service.BackgroundResponseStatusFailed
+	}, time.Second, 10*time.Millisecond)
+	got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
+	require.NoError(t, err)
+	require.Equal(t, "upstream_rate_limited", gjson.GetBytes(got.Error, "type").String())
+	require.Equal(t, "req_429", gjson.GetBytes(got.Error, "upstream_request_id").String())
+	require.Equal(t, "12", gjson.GetBytes(got.Error, "retry_after").String())
+	require.True(t, gjson.GetBytes(got.Error, "failed_at").Int() > 0)
+}
+
+func TestBackgroundResponseIdempotencyReplayDoesNotStartDuplicateWorker(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	started := 0
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
+	h.execute = func(c *gin.Context) {
+		started++
+		c.JSON(http.StatusOK, gin.H{"id": "resp_up_once", "object": "response", "status": service.BackgroundResponseStatusCompleted, "output": []gin.H{}})
+	}
+	router := backgroundResponseTestRouter(h)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(heavyWebSearchBackgroundRequestBody()))
+		req.Header.Set("Idempotency-Key", "replay-key")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+	}
+	require.Eventually(t, func() bool { return started == 1 }, time.Second, 10*time.Millisecond)
+}
+
+func backgroundResponseTestRouter(h *BackgroundResponseHandler) http.Handler {
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{ID: 9, UserID: 7})
+		c.Next()
+	})
+	router.POST("/v1/responses", func(c *gin.Context) {
+		if !h.TrySubmit(c) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "not handled"})
+		}
+	})
+	router.GET("/v1/responses/:response_id", h.Get)
+	return router
 }
 
 func submitHeavyBackgroundForTest(t *testing.T, router http.Handler) string {

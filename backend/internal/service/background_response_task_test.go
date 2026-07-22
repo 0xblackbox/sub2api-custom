@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -13,10 +14,11 @@ import (
 )
 
 type backgroundResponseMemoryStore struct {
-	task    *BackgroundResponseTaskRecord
-	ttl     time.Duration
-	saveErr error
-	getErr  error
+	task          *BackgroundResponseTaskRecord
+	ttl           time.Duration
+	saveErr       error
+	getErr        error
+	idempotencies map[string]string
 }
 
 func (s *backgroundResponseMemoryStore) Save(_ context.Context, task *BackgroundResponseTaskRecord, ttl time.Duration) error {
@@ -57,6 +59,36 @@ func (s *backgroundResponseMemoryStore) ListActive(_ context.Context, limit int)
 	return []*BackgroundResponseTaskRecord{&copy}[:min(1, max(1, limit))], nil
 }
 
+func (s *backgroundResponseMemoryStore) ReserveIdempotency(_ context.Context, owner BackgroundResponseOwner, keyHash, taskID string, _ time.Duration) (string, bool, error) {
+	if keyHash == "" || taskID == "" {
+		return "", true, nil
+	}
+	if s.idempotencies == nil {
+		s.idempotencies = make(map[string]string)
+	}
+	key := backgroundResponseMemoryIdempotencyKey(owner, keyHash)
+	if existing := s.idempotencies[key]; existing != "" {
+		return existing, false, nil
+	}
+	s.idempotencies[key] = taskID
+	return "", true, nil
+}
+
+func (s *backgroundResponseMemoryStore) ReleaseIdempotency(_ context.Context, owner BackgroundResponseOwner, keyHash, taskID string) error {
+	if s.idempotencies == nil {
+		return nil
+	}
+	key := backgroundResponseMemoryIdempotencyKey(owner, keyHash)
+	if s.idempotencies[key] == taskID {
+		delete(s.idempotencies, key)
+	}
+	return nil
+}
+
+func backgroundResponseMemoryIdempotencyKey(owner BackgroundResponseOwner, keyHash string) string {
+	return strconv.FormatInt(owner.UserID, 10) + ":" + strconv.FormatInt(owner.APIKeyID, 10) + ":" + keyHash
+}
+
 func TestBackgroundResponseTaskLifecycleAndOwnership(t *testing.T) {
 	store := &backgroundResponseMemoryStore{}
 	svc := NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, 10*time.Minute)
@@ -78,6 +110,14 @@ func TestBackgroundResponseTaskLifecycleAndOwnership(t *testing.T) {
 	processing, err := svc.Get(context.Background(), owner, created.ID)
 	require.NoError(t, err)
 	require.Equal(t, BackgroundResponseStatusInProgress, processing.Status)
+	require.NotNil(t, processing.StartedAt)
+
+	require.NoError(t, svc.AttachUpstream(context.Background(), created.ID, 123, "resp_upstream", "req_upstream"))
+	mapped, err := svc.Get(context.Background(), owner, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, int64(123), mapped.UpstreamAccountID)
+	require.Equal(t, "resp_upstream", mapped.UpstreamResponseID)
+	require.Equal(t, "req_upstream", mapped.UpstreamRequestID)
 
 	result := json.RawMessage(`{"id":"resp_upstream","object":"response","status":"completed","output":[]}`)
 	require.NoError(t, svc.Complete(context.Background(), created.ID, http.StatusOK, result))
@@ -87,6 +127,25 @@ func TestBackgroundResponseTaskLifecycleAndOwnership(t *testing.T) {
 	require.Equal(t, http.StatusOK, completed.HTTPStatus)
 	require.JSONEq(t, string(result), string(completed.Result))
 	require.NotNil(t, completed.CompletedAt)
+}
+
+func TestBackgroundResponseTaskIdempotencyReplaysExistingTask(t *testing.T) {
+	store := &backgroundResponseMemoryStore{}
+	svc := NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Minute)
+	owner := BackgroundResponseOwner{UserID: 7, APIKeyID: 9}
+	meta := BackgroundResponseTaskMetadata{RequestFingerprint: "fp", IdempotencyKeyHash: "hash"}
+
+	created, fresh, err := svc.CreateWithMetadata(context.Background(), owner, "gpt-5.6-sol", meta)
+	require.NoError(t, err)
+	require.True(t, fresh)
+
+	replayed, fresh, err := svc.CreateWithMetadata(context.Background(), owner, "gpt-5.6-sol", meta)
+	require.NoError(t, err)
+	require.False(t, fresh)
+	require.Equal(t, created.ID, replayed.ID)
+
+	_, _, err = svc.CreateWithMetadata(context.Background(), owner, "gpt-5.6-sol", BackgroundResponseTaskMetadata{RequestFingerprint: "different", IdempotencyKeyHash: "hash"})
+	require.ErrorIs(t, err, ErrIdempotencyKeyConflict)
 }
 
 func TestBackgroundResponseTaskCancel(t *testing.T) {

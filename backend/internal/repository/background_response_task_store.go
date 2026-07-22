@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 )
 
 const backgroundResponseTaskKeyPrefix = "background_response_task:"
+const backgroundResponseIdempotencyKeyPrefix = "background_response_idempotency:"
 
 type backgroundResponseTaskStore struct {
 	rdb *redis.Client
@@ -82,6 +84,58 @@ func (s *backgroundResponseTaskStore) ListActive(ctx context.Context, limit int)
 	}
 }
 
+func (s *backgroundResponseTaskStore) ReserveIdempotency(ctx context.Context, owner service.BackgroundResponseOwner, keyHash, taskID string, ttl time.Duration) (string, bool, error) {
+	key := backgroundResponseIdempotencyKey(owner, keyHash)
+	if key == "" || strings.TrimSpace(taskID) == "" {
+		return "", true, nil
+	}
+	reserved, err := s.rdb.SetNX(ctx, key, strings.TrimSpace(taskID), ttl).Result()
+	if err != nil {
+		return "", false, err
+	}
+	if reserved {
+		return "", true, nil
+	}
+	existing, err := s.rdb.Get(ctx, key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return "", false, service.ErrBackgroundResponseNotFound
+		}
+		return "", false, err
+	}
+	return strings.TrimSpace(existing), false, nil
+}
+
+func (s *backgroundResponseTaskStore) ReleaseIdempotency(ctx context.Context, owner service.BackgroundResponseOwner, keyHash, taskID string) error {
+	key := backgroundResponseIdempotencyKey(owner, keyHash)
+	if key == "" || strings.TrimSpace(taskID) == "" {
+		return nil
+	}
+	existing, err := s.rdb.Get(ctx, key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil
+		}
+		return err
+	}
+	if strings.TrimSpace(existing) != strings.TrimSpace(taskID) {
+		return nil
+	}
+	return s.rdb.Del(ctx, key).Err()
+}
+
 func backgroundResponseTaskKey(id string) string {
 	return backgroundResponseTaskKeyPrefix + strings.TrimSpace(id)
+}
+
+func backgroundResponseIdempotencyKey(owner service.BackgroundResponseOwner, keyHash string) string {
+	keyHash = strings.TrimSpace(keyHash)
+	if owner.UserID <= 0 || owner.APIKeyID <= 0 || keyHash == "" {
+		return ""
+	}
+	return backgroundResponseIdempotencyKeyPrefix + strings.Join([]string{
+		strconv.FormatInt(owner.UserID, 10),
+		strconv.FormatInt(owner.APIKeyID, 10),
+		keyHash,
+	}, ":")
 }

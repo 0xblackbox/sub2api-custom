@@ -5,14 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
@@ -24,21 +27,33 @@ import (
 )
 
 // BackgroundResponseHandler detaches background=true requests from the client
-// connection, executes the existing Responses gateway in streaming mode, drains
-// the SSE stream server-side, and stores the final Response object in Redis for
-// later polling.
+// connection, creates a native upstream Responses background task, and stores a
+// proxy-id -> upstream-id mapping so workers poll with short GET requests rather
+// than holding a 15 minute SSE/HTTP connection open.
 type BackgroundResponseHandler struct {
-	tasks      *service.BackgroundResponseTaskService
-	openAI     *OpenAIGatewayHandler
-	execute    func(c *gin.Context)
-	heavyQueue *backgroundResponseHeavyQueue
-	running    sync.Map // response_id -> context.CancelFunc
+	tasks          *service.BackgroundResponseTaskService
+	openAI         *OpenAIGatewayHandler
+	execute        func(c *gin.Context)
+	fetchUpstream  func(ctx context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error)
+	cancelUpstream func(ctx context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error)
+	pollInterval   time.Duration
+	heavyQueue     *backgroundResponseHeavyQueue
+	running        sync.Map // response_id -> context.CancelFunc
+}
+
+type backgroundUpstreamPollResult struct {
+	statusCode        int
+	body              []byte
+	upstreamRequestID string
+	retryAfter        string
 }
 
 func NewBackgroundResponseHandler(tasks *service.BackgroundResponseTaskService, openAI *OpenAIGatewayHandler) *BackgroundResponseHandler {
-	h := &BackgroundResponseHandler{tasks: tasks, openAI: openAI, heavyQueue: defaultBackgroundResponseHeavyQueue}
+	h := &BackgroundResponseHandler{tasks: tasks, openAI: openAI, heavyQueue: defaultBackgroundResponseHeavyQueue, pollInterval: 3 * time.Second}
 	h.execute = h.executeWithGateway
-	h.failActiveBackgroundTasksOnStartup()
+	h.fetchUpstream = h.fetchNativeUpstreamBackgroundResponse
+	h.cancelUpstream = h.cancelNativeUpstreamBackgroundResponse
+	h.recoverActiveBackgroundTasksOnStartup()
 	return h
 }
 
@@ -190,20 +205,40 @@ func (h *BackgroundResponseHandler) acquireHeavyWebSearchQueue(ctx context.Conte
 	return q.acquire(ctx, userID)
 }
 
-func (h *BackgroundResponseHandler) failActiveBackgroundTasksOnStartup() {
+func (h *BackgroundResponseHandler) recoverActiveBackgroundTasksOnStartup() {
 	if h == nil || h.tasks == nil || !h.tasks.Enabled() {
 		return
 	}
 	go func() {
-		failed, err := h.tasks.FailActiveOnStartup(context.Background(), 1000)
-		fields := []zap.Field{zap.Int("failed_active_tasks", failed)}
+		active, err := h.tasks.ListActive(context.Background(), 1000)
+		fields := []zap.Field{zap.Int("active_tasks", len(active))}
 		if err != nil {
 			fields = append(fields, zap.Error(err))
 			logger.L().Warn("background_response.startup_recovery_failed", fields...)
 			return
 		}
-		if failed > 0 {
-			logger.L().Warn("background_response.startup_recovered_active_tasks", fields...)
+		resumed := 0
+		failed := 0
+		for _, task := range active {
+			if task == nil {
+				continue
+			}
+			if strings.TrimSpace(task.UpstreamResponseID) != "" && task.UpstreamAccountID > 0 {
+				resumed++
+				go h.resumePolling(task)
+				continue
+			}
+			if err := h.tasks.Fail(context.Background(), task.ID, http.StatusServiceUnavailable, backgroundResponseAuditedErrorPayload(task, "background_task_failed", "background task did not survive proxy restart before upstream response id was stored", "")); err != nil {
+				logger.L().Warn("background_response.startup_fail_unmapped_task_failed", zap.String("response_id", task.ID), zap.Error(err))
+				continue
+			}
+			failed++
+		}
+		if resumed > 0 || failed > 0 {
+			logger.L().Warn("background_response.startup_recovered_active_tasks",
+				zap.Int("resumed_active_tasks", resumed),
+				zap.Int("failed_unmapped_tasks", failed),
+			)
 		}
 	}()
 }
@@ -275,24 +310,34 @@ func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte, opts bac
 		}
 		if q != nil && !q.canAcceptWaitingSlot() {
 			c.Header("Retry-After", "3")
-			backgroundResponseJSONError(c, http.StatusTooManyRequests, "proxy_heavy_queue_full", "heavy web search queue is full, please retry later")
+			backgroundResponseJSONError(c, http.StatusTooManyRequests, "proxy_background_queue_full", "background heavy web search queue is full, please retry later")
 			return
 		}
 	}
 
-	// The gateway itself owns persistence. Do not ask subscription/OAuth
-	// upstreams to implement OpenAI's background lifecycle as well.
-	executionBody, err := normalizeBackgroundResponseExecutionBody(body)
+	// Preserve the official Responses background contract upstream. The previous
+	// implementation removed background=true and drained a local SSE stream for
+	// the whole model turn; production gateways cut those connections around the
+	// 704-904s mark. Native background creation returns an upstream response id,
+	// then workers poll via short GET requests.
+	executionBody, err := normalizeBackgroundResponseNativeCreateBody(body)
 	if err != nil {
 		backgroundResponseJSONError(c, http.StatusBadRequest, "invalid_request_error", "Failed to normalize background request")
 		return
 	}
-	task, err := h.tasks.Create(c.Request.Context(), service.BackgroundResponseOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}, model)
+	owner := service.BackgroundResponseOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}
+	meta, upstreamIdempotencyKey, err := backgroundResponseTaskMetadata(c, owner, body)
+	if err != nil {
+		backgroundResponseError(c, err)
+		return
+	}
+	task, created, err := h.tasks.CreateWithMetadata(c.Request.Context(), owner, model, meta)
 	if err != nil {
 		backgroundResponseError(c, err)
 		return
 	}
 	taskCtx, recorder, cancel := newBackgroundResponseContext(c, executionBody, h.tasks.ExecutionTimeout())
+	ensureBackgroundUpstreamIdempotencyKey(taskCtx.Request, upstreamIdempotencyKey, task.ID)
 	taskCtx.Set(responsesInternalBackgroundExecuteKey, true)
 
 	c.Header("Cache-Control", "no-store")
@@ -304,10 +349,13 @@ func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte, opts bac
 	if opts.heavyWebSearch {
 		c.Header("X-SubtoProxy-Background-Queue", "heavy_web_search")
 	}
-	c.JSON(http.StatusOK, backgroundResponsePendingPayload(task))
+	backgroundResponseWriteStoredTask(c, task)
 
-	owner := service.BackgroundResponseOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}
-	go h.run(task.ID, taskCtx, recorder, cancel, owner, opts)
+	if created && !backgroundResponseTaskTerminalForHandler(task.Status) {
+		go h.run(task.ID, taskCtx, recorder, cancel, owner, opts)
+		return
+	}
+	cancel()
 }
 
 func (h *BackgroundResponseHandler) Get(c *gin.Context) {
@@ -364,6 +412,17 @@ func (h *BackgroundResponseHandler) Cancel(c *gin.Context) {
 	if cancelAny, ok := h.running.Load(responseID); ok {
 		if cancel, ok := cancelAny.(context.CancelFunc); ok && cancel != nil {
 			cancel()
+		}
+	}
+	if current, getErr := h.tasks.Get(c.Request.Context(), service.BackgroundResponseOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}, responseID); getErr == nil && current != nil && !backgroundResponseTaskTerminalForHandler(current.Status) {
+		if h.cancelUpstream != nil && current.UpstreamAccountID > 0 && strings.TrimSpace(current.UpstreamResponseID) != "" {
+			cancelCtx, cancelFn := context.WithTimeout(context.Background(), 10*time.Second)
+			if result, err := h.cancelUpstream(cancelCtx, current); err != nil {
+				logger.L().Warn("background_response.upstream_cancel_failed", zap.String("response_id", responseID), zap.String("upstream_response_id", current.UpstreamResponseID), zap.Error(err))
+			} else if result != nil && result.upstreamRequestID != "" {
+				_ = h.tasks.AttachUpstream(context.Background(), responseID, current.UpstreamAccountID, current.UpstreamResponseID, result.upstreamRequestID)
+			}
+			cancelFn()
 		}
 	}
 	task, err := h.tasks.Cancel(c.Request.Context(), service.BackgroundResponseOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}, responseID)
@@ -433,7 +492,7 @@ func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, rec
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			logger.L().Error("background_response.execution_panicked", zap.String("response_id", taskID), zap.Any("panic", recovered))
-			h.failTask(taskID, http.StatusInternalServerError, backgroundResponseErrorPayload("api_error", "background response panicked"))
+			h.failTaskWithAudit(taskID, http.StatusInternalServerError, "api_error", "background response panicked", "")
 		}
 	}()
 	if opts.heavyWebSearch {
@@ -450,10 +509,10 @@ func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, rec
 				return
 			}
 			if errors.Is(err, errBackgroundHeavyQueueFull) {
-				h.failTask(taskID, http.StatusTooManyRequests, backgroundResponseErrorPayload("proxy_heavy_queue_full", "heavy web search queue is full"))
+				h.failTaskWithAudit(taskID, http.StatusTooManyRequests, "proxy_background_queue_full", "background heavy web search queue is full", "")
 				return
 			}
-			h.failTask(taskID, http.StatusServiceUnavailable, backgroundResponseErrorPayload("proxy_heavy_queue_timeout", "heavy web search queue timed out before execution"))
+			h.failTaskWithAudit(taskID, http.StatusTooManyRequests, "proxy_user_concurrency_timeout", "timeout waiting for heavy web search queue", "")
 			return
 		}
 		defer release()
@@ -474,44 +533,67 @@ func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, rec
 	if h.isTaskCancelled(taskID, owner) {
 		return
 	}
-	h.execute(taskCtx)
-	body := bytes.TrimSpace(recorder.Body.Bytes())
-	if err := taskCtx.Request.Context().Err(); err != nil && len(body) == 0 {
+
+	createStatus, createBody, upstreamRequestID, createRetryAfter, accountID := h.executeNativeBackgroundCreate(taskCtx, recorder)
+	if accountID > 0 || upstreamRequestID != "" {
+		_ = h.tasks.AttachUpstream(context.Background(), taskID, accountID, "", upstreamRequestID)
+	}
+	if err := taskCtx.Request.Context().Err(); err != nil && len(createBody) == 0 {
 		if errors.Is(err, context.Canceled) {
 			h.cancelTask(taskID)
 			return
 		}
-		h.failTask(taskID, http.StatusGatewayTimeout, backgroundResponseErrorPayload("upstream_timeout", "background response timed out"))
+		h.failTaskWithAudit(taskID, http.StatusGatewayTimeout, "upstream_timeout", "background response create timed out", upstreamRequestID)
 		return
 	}
-	statusCode := recorder.Code
-	if statusCode == 0 {
-		statusCode = http.StatusOK
+
+	if h.handleNativeBackgroundCreateResult(taskID, owner, createStatus, createBody, accountID, upstreamRequestID) {
+		return
 	}
-	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
-		if len(body) == 0 || !json.Valid(body) {
-			if finalResponse, ok := backgroundResponseFinalResponseFromSSE(body, taskID); ok {
-				if err := h.tasks.Complete(context.Background(), taskID, statusCode, finalResponse); err != nil {
-					logger.L().Error("background_response.complete_store_failed", zap.String("response_id", taskID), zap.Error(err))
-				}
-				return
+	if createStatus >= http.StatusOK && createStatus < http.StatusMultipleChoices {
+		if finalResponse, ok := backgroundResponseFinalResponseFromSSE(createBody, taskID); ok {
+			if err := h.tasks.Complete(context.Background(), taskID, createStatus, finalResponse); err != nil {
+				logger.L().Error("background_response.complete_store_failed", zap.String("response_id", taskID), zap.Error(err))
 			}
-			if taskErr, ok := backgroundResponseErrorFromSSE(body); ok {
-				h.failTask(taskID, http.StatusBadGateway, taskErr)
-				return
-			}
-			h.failTask(taskID, http.StatusBadGateway, backgroundResponseErrorPayload("api_error", "upstream returned an invalid response"))
 			return
 		}
-		if err := h.tasks.Complete(context.Background(), taskID, statusCode, json.RawMessage(body)); err != nil {
-			logger.L().Error("background_response.complete_store_failed", zap.String("response_id", taskID), zap.Error(err))
+		if taskErr, ok := backgroundResponseErrorFromSSE(createBody); ok {
+			h.failTask(taskID, http.StatusBadGateway, taskErr)
+			return
 		}
+	}
+
+	// EOF/reset after response.created is recoverable: the upstream task already
+	// exists, so do not convert the dropped transport into a terminal failure.
+	if upstreamID := backgroundResponseUpstreamIDFromSSE(createBody); upstreamID != "" {
+		if err := h.tasks.AttachUpstream(context.Background(), taskID, accountID, upstreamID, upstreamRequestID); err != nil {
+			logger.L().Error("background_response.attach_upstream_from_sse_failed", zap.String("response_id", taskID), zap.String("upstream_response_id", upstreamID), zap.Error(err))
+		}
+		h.pollNativeBackground(taskID, owner)
 		return
 	}
-	h.failTask(taskID, statusCode, classifyBackgroundResponseFailure(statusCode, body, extractBackgroundResponseError(body)))
+
+	// If a transient transport EOF happened before any upstream id was observed,
+	// retry exactly once using the same Idempotency-Key. This is the only safe
+	// duplicate-create recovery path.
+	if backgroundResponseCreateCanRetryWithoutResponseID(createStatus, createBody) {
+		retryCtx, retryRecorder := cloneBackgroundResponseExecutionContext(taskCtx)
+		retryStatus, retryBody, retryRequestID, retryRetryAfter, retryAccountID := h.executeNativeBackgroundCreate(retryCtx, retryRecorder)
+		if h.handleNativeBackgroundCreateResult(taskID, owner, retryStatus, retryBody, retryAccountID, retryRequestID) {
+			return
+		}
+		createStatus, createBody, upstreamRequestID, createRetryAfter, accountID = retryStatus, retryBody, retryRequestID, retryRetryAfter, retryAccountID
+	}
+
+	h.failTask(taskID, createStatus, backgroundResponseAttachRetryAfter(classifyBackgroundResponseFailure(createStatus, createBody, extractBackgroundResponseError(createBody)), createRetryAfter))
 }
 
 func (h *BackgroundResponseHandler) failTask(taskID string, statusCode int, taskErr json.RawMessage) {
+	if h != nil && h.tasks != nil {
+		if task, err := h.tasks.GetByID(context.Background(), taskID); err == nil {
+			taskErr = backgroundResponseAttachAuditFields(task, taskErr, "")
+		}
+	}
 	if err := h.tasks.Fail(context.Background(), taskID, statusCode, taskErr); err != nil {
 		logger.L().Error("background_response.failure_store_failed", zap.String("response_id", taskID), zap.Error(err))
 	}
@@ -540,23 +622,238 @@ func (h *BackgroundResponseHandler) isTaskCancelled(taskID string, owner service
 	return err == nil && task.Status == service.BackgroundResponseStatusCancelled
 }
 
-func normalizeBackgroundResponseExecutionBody(body []byte) ([]byte, error) {
+func (h *BackgroundResponseHandler) executeNativeBackgroundCreate(c *gin.Context, recorder *httptest.ResponseRecorder) (int, []byte, string, string, int64) {
+	if recorder == nil {
+		recorder = httptest.NewRecorder()
+	}
+	h.execute(c)
+	body := bytes.TrimSpace(recorder.Body.Bytes())
+	statusCode := recorder.Code
+	if statusCode == 0 {
+		statusCode = http.StatusOK
+	}
+	upstreamRequestID := strings.TrimSpace(recorder.Header().Get("x-request-id"))
+	accountID, _ := c.Request.Context().Value(ctxkey.AccountID).(int64)
+	return statusCode, body, upstreamRequestID, strings.TrimSpace(recorder.Header().Get("Retry-After")), accountID
+}
+
+func (h *BackgroundResponseHandler) handleNativeBackgroundCreateResult(taskID string, owner service.BackgroundResponseOwner, statusCode int, body []byte, accountID int64, upstreamRequestID string) bool {
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices || len(body) == 0 || !json.Valid(body) {
+		return false
+	}
+	upstreamID := strings.TrimSpace(gjson.GetBytes(body, "id").String())
+	if upstreamID == "" {
+		upstreamID = strings.TrimSpace(gjson.GetBytes(body, "response.id").String())
+	}
+	if err := h.tasks.AttachUpstream(context.Background(), taskID, accountID, upstreamID, upstreamRequestID); err != nil {
+		logger.L().Error("background_response.attach_upstream_failed", zap.String("response_id", taskID), zap.String("upstream_response_id", upstreamID), zap.Error(err))
+	}
+	switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "status").String())) {
+	case service.BackgroundResponseStatusCompleted:
+		h.completeTaskWithNativeResult(taskID, statusCode, body)
+		return true
+	case service.BackgroundResponseStatusFailed:
+		h.failTaskWithAudit(taskID, statusCode, "upstream_background_failed", backgroundResponseErrorMessage(extractBackgroundResponseError(body), "upstream background response failed"), upstreamRequestID)
+		return true
+	case service.BackgroundResponseStatusCancelled, "canceled":
+		h.cancelTask(taskID)
+		return true
+	case service.BackgroundResponseStatusQueued, service.BackgroundResponseStatusInProgress:
+		if upstreamID == "" {
+			return false
+		}
+		h.pollNativeBackground(taskID, owner)
+		return true
+	default:
+		if upstreamID != "" {
+			h.pollNativeBackground(taskID, owner)
+			return true
+		}
+		// Some compat upstreams can still return a completed-looking Response with
+		// no explicit status. Treat an output-bearing JSON response as terminal.
+		if gjson.GetBytes(body, "output").Exists() {
+			h.completeTaskWithNativeResult(taskID, statusCode, body)
+			return true
+		}
+		return false
+	}
+}
+
+func (h *BackgroundResponseHandler) pollNativeBackground(taskID string, owner service.BackgroundResponseOwner) {
+	if h == nil || h.tasks == nil {
+		return
+	}
+	timeout := h.tasks.ExecutionTimeout()
+	if timeout < 30*time.Minute {
+		timeout = 30 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
+		if h.isTaskCancelled(taskID, owner) {
+			return
+		}
+		task, err := h.tasks.Get(context.Background(), owner, taskID)
+		if err != nil {
+			logger.L().Warn("background_response.poll_load_task_failed", zap.String("response_id", taskID), zap.Error(err))
+			return
+		}
+		if backgroundResponseTaskTerminalForHandler(task.Status) {
+			return
+		}
+		result, err := h.fetchNativeBackground(ctx, task)
+		if err != nil {
+			if ctx.Err() != nil {
+				h.failTaskWithAudit(taskID, http.StatusGatewayTimeout, "proxy_task_deadline_exceeded", "background task deadline exceeded", task.UpstreamRequestID)
+				return
+			}
+			classification := classifyBackgroundTransportError(err)
+			logger.L().Warn("background_response.poll_upstream_error",
+				zap.String("response_id", taskID),
+				zap.String("upstream_response_id", task.UpstreamResponseID),
+				zap.String("error_type", classification),
+				zap.Error(err),
+			)
+			if !backgroundResponseWaitForNextPoll(ctx, h.pollInterval, "") {
+				h.failTaskWithAudit(taskID, http.StatusGatewayTimeout, "proxy_task_deadline_exceeded", "background task deadline exceeded", task.UpstreamRequestID)
+				return
+			}
+			continue
+		}
+		if result == nil {
+			if !backgroundResponseWaitForNextPoll(ctx, h.pollInterval, "") {
+				h.failTaskWithAudit(taskID, http.StatusGatewayTimeout, "proxy_task_deadline_exceeded", "background task deadline exceeded", task.UpstreamRequestID)
+				return
+			}
+			continue
+		}
+		if result.upstreamRequestID != "" {
+			_ = h.tasks.AttachUpstream(context.Background(), taskID, task.UpstreamAccountID, task.UpstreamResponseID, result.upstreamRequestID)
+		}
+		if result.statusCode >= http.StatusOK && result.statusCode < http.StatusMultipleChoices && json.Valid(result.body) {
+			switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(result.body, "status").String())) {
+			case service.BackgroundResponseStatusCompleted:
+				h.completeTaskWithNativeResult(taskID, result.statusCode, result.body)
+				return
+			case service.BackgroundResponseStatusFailed:
+				h.failTaskWithAudit(taskID, result.statusCode, "upstream_background_failed", backgroundResponseErrorMessage(extractBackgroundResponseError(result.body), "upstream background response failed"), result.upstreamRequestID)
+				return
+			case service.BackgroundResponseStatusCancelled, "canceled":
+				h.cancelTask(taskID)
+				return
+			case service.BackgroundResponseStatusQueued, service.BackgroundResponseStatusInProgress, "":
+				if !backgroundResponseWaitForNextPoll(ctx, h.pollInterval, result.retryAfter) {
+					h.failTaskWithAudit(taskID, http.StatusGatewayTimeout, "proxy_task_deadline_exceeded", "background task deadline exceeded", result.upstreamRequestID)
+					return
+				}
+				continue
+			default:
+				h.failTaskWithAudit(taskID, http.StatusBadGateway, "upstream_background_failed", "upstream returned an unknown background status", result.upstreamRequestID)
+				return
+			}
+		}
+		if result.statusCode == http.StatusTooManyRequests || backgroundResponseIsTransientPollFailure(result.statusCode, result.body) {
+			logger.L().Warn("background_response.poll_upstream_transient_status",
+				zap.String("response_id", taskID),
+				zap.String("upstream_response_id", task.UpstreamResponseID),
+				zap.Int("upstream_status", result.statusCode),
+				zap.String("retry_after", result.retryAfter),
+				zap.String("error_type", strings.TrimSpace(gjson.GetBytes(classifyBackgroundResponseFailure(result.statusCode, result.body, extractBackgroundResponseError(result.body)), "type").String())),
+			)
+			if !backgroundResponseWaitForNextPoll(ctx, h.pollInterval, result.retryAfter) {
+				h.failTaskWithAudit(taskID, http.StatusGatewayTimeout, "proxy_task_deadline_exceeded", "background task deadline exceeded", result.upstreamRequestID)
+				return
+			}
+			continue
+		}
+		h.failTask(taskID, result.statusCode, classifyBackgroundResponseFailure(result.statusCode, result.body, extractBackgroundResponseError(result.body)))
+		return
+	}
+}
+
+func (h *BackgroundResponseHandler) fetchNativeBackground(ctx context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error) {
+	if h != nil && h.fetchUpstream != nil {
+		return h.fetchUpstream(ctx, task)
+	}
+	return h.fetchNativeUpstreamBackgroundResponse(ctx, task)
+}
+
+func (h *BackgroundResponseHandler) fetchNativeUpstreamBackgroundResponse(ctx context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error) {
+	if h == nil || h.openAI == nil || h.openAI.gatewayService == nil || task == nil {
+		return nil, errors.New("background upstream poller unavailable")
+	}
+	result, err := h.openAI.gatewayService.FetchOpenAIBackgroundResponse(ctx, task.UpstreamAccountID, task.UpstreamResponseID)
+	if err != nil {
+		return nil, err
+	}
+	return &backgroundUpstreamPollResult{statusCode: result.StatusCode, body: result.Body, upstreamRequestID: result.UpstreamRequestID, retryAfter: result.RetryAfter}, nil
+}
+
+func (h *BackgroundResponseHandler) cancelNativeUpstreamBackgroundResponse(ctx context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error) {
+	if h == nil || h.openAI == nil || h.openAI.gatewayService == nil || task == nil || task.UpstreamAccountID <= 0 || strings.TrimSpace(task.UpstreamResponseID) == "" {
+		return nil, nil
+	}
+	result, err := h.openAI.gatewayService.CancelOpenAIBackgroundResponse(ctx, task.UpstreamAccountID, task.UpstreamResponseID)
+	if err != nil {
+		return nil, err
+	}
+	return &backgroundUpstreamPollResult{statusCode: result.StatusCode, body: result.Body, upstreamRequestID: result.UpstreamRequestID, retryAfter: result.RetryAfter}, nil
+}
+
+func (h *BackgroundResponseHandler) resumePolling(task *service.BackgroundResponseTaskRecord) {
+	if h == nil || task == nil {
+		return
+	}
+	owner := service.BackgroundResponseOwner{UserID: task.UserID, APIKeyID: task.APIKeyID}
+	_, cancel := context.WithCancel(context.Background())
+	h.running.Store(task.ID, cancel)
+	defer h.running.Delete(task.ID)
+	defer cancel()
+	h.pollNativeBackground(task.ID, owner)
+}
+
+func (h *BackgroundResponseHandler) completeTaskWithNativeResult(taskID string, statusCode int, body []byte) {
+	task, _ := h.tasks.GetByID(context.Background(), taskID)
+	result := backgroundResponseNormalizeNativeResult(body, taskID, "")
+	if task != nil {
+		result = backgroundResponseNormalizeNativeResult(body, taskID, task.Model)
+	}
+	if err := h.tasks.Complete(context.Background(), taskID, statusCode, json.RawMessage(result)); err != nil {
+		logger.L().Error("background_response.complete_store_failed", zap.String("response_id", taskID), zap.Error(err))
+	}
+}
+
+func (h *BackgroundResponseHandler) failTaskWithAudit(taskID string, statusCode int, errorType, message, upstreamRequestID string) {
+	task, _ := h.tasks.GetByID(context.Background(), taskID)
+	h.failTask(taskID, statusCode, backgroundResponseAuditedErrorPayload(task, errorType, message, upstreamRequestID))
+}
+
+func cloneBackgroundResponseExecutionContext(c *gin.Context) (*gin.Context, *httptest.ResponseRecorder) {
+	recorder := httptest.NewRecorder()
+	recorderCtx, _ := gin.CreateTestContext(recorder)
+	clone := c.Copy()
+	clone.Writer = recorderCtx.Writer
+	request := c.Request.Clone(c.Request.Context())
+	if c.Request.GetBody != nil {
+		if body, err := c.Request.GetBody(); err == nil {
+			request.Body = body
+		}
+	}
+	clone.Request = request
+	return clone, recorder
+}
+
+func normalizeBackgroundResponseNativeCreateBody(body []byte) ([]byte, error) {
 	var err error
-	body, err = sjson.DeleteBytes(body, "background")
+	body, err = sjson.SetBytes(body, "background", true)
 	if err != nil {
 		return nil, err
 	}
-	// OAuth / ChatGPT internal upstreams often cut long non-streaming requests
-	// around the proxy/LB timeout boundary. Execute local background jobs via
-	// streaming drain instead, then persist the terminal Response object so the
-	// public polling contract still matches OpenAI's background API.
-	body, err = sjson.SetBytes(body, "stream", true)
+	body, err = sjson.SetBytes(body, "store", true)
 	if err != nil {
 		return nil, err
 	}
-	// Local Redis is the persistence boundary. This also keeps ChatGPT OAuth
-	// upstreams compatible when they only accept store=false.
-	body, err = sjson.SetBytes(body, "store", false)
+	body, err = sjson.SetBytes(body, "stream", false)
 	if err != nil {
 		return nil, err
 	}
@@ -630,6 +927,184 @@ func backgroundResponseRequiresToolUse(body []byte, summaryToolChoice string) bo
 	}
 	summaryToolChoice = strings.ToLower(strings.TrimSpace(summaryToolChoice))
 	return summaryToolChoice == "required" || strings.Contains(summaryToolChoice, "web_search")
+}
+
+func backgroundResponseTaskMetadata(c *gin.Context, owner service.BackgroundResponseOwner, body []byte) (service.BackgroundResponseTaskMetadata, string, error) {
+	var meta service.BackgroundResponseTaskMetadata
+	fingerprint, err := service.BuildIdempotencyFingerprint("POST", "/v1/responses", fmt.Sprintf("%d:%d", owner.UserID, owner.APIKeyID), json.RawMessage(body))
+	if err == nil {
+		meta.RequestFingerprint = fingerprint
+	}
+	rawKey := ""
+	if c != nil && c.Request != nil {
+		rawKey = c.GetHeader("Idempotency-Key")
+		if rawKey == "" {
+			rawKey = c.GetHeader("X-Idempotency-Key")
+		}
+	}
+	key, keyErr := service.NormalizeIdempotencyKey(rawKey)
+	if keyErr != nil {
+		return meta, "", keyErr
+	}
+	if key != "" {
+		meta.IdempotencyKeyHash = service.HashIdempotencyKey(key)
+	}
+	return meta, key, err
+}
+
+func ensureBackgroundUpstreamIdempotencyKey(request *http.Request, inboundKey, taskID string) {
+	if request == nil {
+		return
+	}
+	key := strings.TrimSpace(inboundKey)
+	if key == "" {
+		key = "subtoproxy-bg-" + strings.TrimSpace(taskID)
+	}
+	if key == "" {
+		return
+	}
+	request.Header.Set("Idempotency-Key", key)
+}
+
+func backgroundResponseWriteStoredTask(c *gin.Context, task *service.BackgroundResponseTaskRecord) {
+	if c == nil || task == nil {
+		return
+	}
+	if task.Status == service.BackgroundResponseStatusCompleted && len(task.Result) > 0 && json.Valid(task.Result) {
+		result := task.Result
+		result, _ = sjson.SetBytes(result, "id", task.ID)
+		result, _ = sjson.SetBytes(result, "background", true)
+		c.Data(http.StatusOK, "application/json; charset=utf-8", result)
+		return
+	}
+	if task.Status == service.BackgroundResponseStatusFailed {
+		c.JSON(http.StatusOK, backgroundResponseFailedPayload(task))
+		return
+	}
+	if task.Status == service.BackgroundResponseStatusCancelled {
+		c.JSON(http.StatusOK, backgroundResponseCancelledPayload(task))
+		return
+	}
+	c.JSON(http.StatusOK, backgroundResponsePendingPayload(task))
+}
+
+func backgroundResponseTaskTerminalForHandler(status string) bool {
+	switch status {
+	case service.BackgroundResponseStatusCompleted, service.BackgroundResponseStatusFailed, service.BackgroundResponseStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func backgroundResponseNormalizeNativeResult(body []byte, proxyID, model string) []byte {
+	if !json.Valid(body) {
+		return body
+	}
+	updated := body
+	if strings.TrimSpace(proxyID) != "" {
+		if next, err := sjson.SetBytes(updated, "id", strings.TrimSpace(proxyID)); err == nil {
+			updated = next
+		}
+	}
+	if strings.TrimSpace(model) != "" {
+		if next, err := sjson.SetBytes(updated, "model", strings.TrimSpace(model)); err == nil {
+			updated = next
+		}
+	}
+	if next, err := sjson.SetBytes(updated, "background", true); err == nil {
+		updated = next
+	}
+	return updated
+}
+
+func backgroundResponseWaitForNextPoll(ctx context.Context, fallback time.Duration, retryAfter string) bool {
+	wait := backgroundResponseRetryAfterDuration(retryAfter)
+	if wait <= 0 {
+		wait = fallback
+	}
+	if wait <= 0 {
+		wait = 3 * time.Second
+	}
+	if wait > 30*time.Second {
+		wait = 30 * time.Second
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func backgroundResponseRetryAfterDuration(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		return time.Until(when)
+	}
+	return 0
+}
+
+func backgroundResponseCreateCanRetryWithoutResponseID(statusCode int, body []byte) bool {
+	if statusCode == http.StatusTooManyRequests {
+		return false
+	}
+	return backgroundResponseIsTransientPollFailure(statusCode, body)
+}
+
+func backgroundResponseIsTransientPollFailure(statusCode int, body []byte) bool {
+	bodyText := strings.ToLower(string(body))
+	return statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout ||
+		strings.Contains(bodyText, "unexpected eof") ||
+		strings.Contains(bodyText, "connection reset") ||
+		strings.Contains(bodyText, "timeout")
+}
+
+func classifyBackgroundTransportError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "unexpected eof"):
+		return "upstream_unexpected_eof"
+	case strings.Contains(text, "connection reset") || strings.Contains(text, "reset by peer"):
+		return "upstream_connection_reset"
+	case strings.Contains(text, "timeout") || errors.Is(err, context.DeadlineExceeded):
+		return "upstream_timeout"
+	default:
+		return "upstream_error"
+	}
+}
+
+func backgroundResponseUpstreamIDFromSSE(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	upstreamID := ""
+	backgroundResponseForEachSSEDataPayload(body, func(data []byte) {
+		if upstreamID != "" || len(data) == 0 || !gjson.ValidBytes(data) {
+			return
+		}
+		switch strings.TrimSpace(gjson.GetBytes(data, "type").String()) {
+		case "response.created", "response.queued", "response.in_progress", "response.completed", "response.done":
+			upstreamID = strings.TrimSpace(gjson.GetBytes(data, "response.id").String())
+		}
+		if upstreamID == "" {
+			upstreamID = strings.TrimSpace(gjson.GetBytes(data, "id").String())
+		}
+	})
+	return upstreamID
 }
 
 func newBackgroundResponseContext(c *gin.Context, body []byte, timeoutDuration time.Duration) (*gin.Context, *httptest.ResponseRecorder, context.CancelFunc) {
@@ -734,8 +1209,12 @@ func classifyBackgroundResponseFailure(statusCode int, body []byte, taskErr json
 	switch {
 	case statusCode == http.StatusTooManyRequests:
 		return backgroundResponseErrorPayload("upstream_rate_limited", backgroundResponseErrorMessage(taskErr, "upstream rate limited"))
+	case strings.Contains(bodyText, "connection reset") || strings.Contains(errText, "connection reset") || strings.Contains(bodyText, "reset by peer") || strings.Contains(errText, "reset by peer"):
+		return backgroundResponseErrorPayload("upstream_connection_reset", backgroundResponseErrorMessage(taskErr, "upstream connection reset"))
 	case strings.Contains(bodyText, "unexpected eof") || strings.Contains(errText, "unexpected eof"):
 		return backgroundResponseErrorPayload("upstream_unexpected_eof", backgroundResponseErrorMessage(taskErr, "upstream connection closed unexpectedly"))
+	case strings.Contains(bodyText, "deadline exceeded") || strings.Contains(errText, "deadline exceeded"):
+		return backgroundResponseErrorPayload("proxy_task_deadline_exceeded", backgroundResponseErrorMessage(taskErr, "background task deadline exceeded"))
 	case statusCode == http.StatusGatewayTimeout || strings.Contains(errText, "timeout"):
 		return backgroundResponseErrorPayload("upstream_timeout", backgroundResponseErrorMessage(taskErr, "upstream request timed out"))
 	default:
@@ -756,8 +1235,49 @@ func backgroundResponseErrorMessage(taskErr json.RawMessage, fallback string) st
 }
 
 func backgroundResponseErrorPayload(errorType, message string) json.RawMessage {
-	data, _ := json.Marshal(gin.H{"type": errorType, "message": message})
+	data, _ := json.Marshal(gin.H{"type": errorType, "code": errorType, "message": message})
 	return data
+}
+
+func backgroundResponseAuditedErrorPayload(task *service.BackgroundResponseTaskRecord, errorType, message, upstreamRequestID string) json.RawMessage {
+	payload := backgroundResponseErrorPayload(errorType, message)
+	return backgroundResponseAttachAuditFields(task, payload, upstreamRequestID)
+}
+
+func backgroundResponseAttachAuditFields(task *service.BackgroundResponseTaskRecord, payload json.RawMessage, upstreamRequestID string) json.RawMessage {
+	if !json.Valid(payload) {
+		return payload
+	}
+	now := time.Now().UTC().Unix()
+	updated := payload
+	updated, _ = sjson.SetBytes(updated, "failed_at", now)
+	if task != nil {
+		if task.CreatedAt > 0 && now >= task.CreatedAt {
+			updated, _ = sjson.SetBytes(updated, "elapsed_seconds", now-task.CreatedAt)
+		}
+		if task.UpstreamResponseID != "" {
+			updated, _ = sjson.SetBytes(updated, "upstream_response_id", task.UpstreamResponseID)
+		}
+		if upstreamRequestID == "" {
+			upstreamRequestID = task.UpstreamRequestID
+		}
+	}
+	if strings.TrimSpace(upstreamRequestID) != "" {
+		updated, _ = sjson.SetBytes(updated, "upstream_request_id", strings.TrimSpace(upstreamRequestID))
+	}
+	return updated
+}
+
+func backgroundResponseAttachRetryAfter(payload json.RawMessage, retryAfter string) json.RawMessage {
+	retryAfter = strings.TrimSpace(retryAfter)
+	if retryAfter == "" || !json.Valid(payload) {
+		return payload
+	}
+	updated, err := sjson.SetBytes(payload, "retry_after", retryAfter)
+	if err != nil {
+		return payload
+	}
+	return updated
 }
 
 func backgroundResponseFinalResponseFromSSE(body []byte, fallbackID string) (json.RawMessage, bool) {

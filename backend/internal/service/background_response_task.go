@@ -31,20 +31,28 @@ var (
 )
 
 // BackgroundResponseTaskRecord is the private Redis representation of a
-// detached Responses API request. UserID and APIKeyID are never returned to
-// callers and prevent one key from reading another key's response.
+// detached Responses API request. UserID/APIKeyID/account identifiers are never
+// returned to callers and prevent one key from reading another key's response.
 type BackgroundResponseTaskRecord struct {
-	ID          string          `json:"id"`
-	UserID      int64           `json:"user_id"`
-	APIKeyID    int64           `json:"api_key_id"`
-	Model       string          `json:"model"`
-	Status      string          `json:"status"`
-	HTTPStatus  int             `json:"http_status,omitempty"`
-	Result      json.RawMessage `json:"result,omitempty"`
-	Error       json.RawMessage `json:"error,omitempty"`
-	CreatedAt   int64           `json:"created_at"`
-	CompletedAt *int64          `json:"completed_at,omitempty"`
-	ExpiresAt   int64           `json:"expires_at"`
+	ID                 string          `json:"id"`
+	UserID             int64           `json:"user_id"`
+	APIKeyID           int64           `json:"api_key_id"`
+	Model              string          `json:"model"`
+	Status             string          `json:"status"`
+	HTTPStatus         int             `json:"http_status,omitempty"`
+	Result             json.RawMessage `json:"result,omitempty"`
+	Error              json.RawMessage `json:"error,omitempty"`
+	CreatedAt          int64           `json:"created_at"`
+	StartedAt          *int64          `json:"started_at,omitempty"`
+	CompletedAt        *int64          `json:"completed_at,omitempty"`
+	FailedAt           *int64          `json:"failed_at,omitempty"`
+	ElapsedSeconds     int64           `json:"elapsed_seconds,omitempty"`
+	ExpiresAt          int64           `json:"expires_at"`
+	UpstreamResponseID string          `json:"upstream_response_id,omitempty"`
+	UpstreamRequestID  string          `json:"upstream_request_id,omitempty"`
+	UpstreamAccountID  int64           `json:"upstream_account_id,omitempty"`
+	RequestFingerprint string          `json:"request_fingerprint,omitempty"`
+	IdempotencyKeyHash string          `json:"idempotency_key_hash,omitempty"`
 }
 
 type BackgroundResponseOwner struct {
@@ -52,10 +60,17 @@ type BackgroundResponseOwner struct {
 	APIKeyID int64
 }
 
+type BackgroundResponseTaskMetadata struct {
+	RequestFingerprint string
+	IdempotencyKeyHash string
+}
+
 type BackgroundResponseTaskStore interface {
 	Save(ctx context.Context, task *BackgroundResponseTaskRecord, ttl time.Duration) error
 	Get(ctx context.Context, id string) (*BackgroundResponseTaskRecord, error)
 	ListActive(ctx context.Context, limit int) ([]*BackgroundResponseTaskRecord, error)
+	ReserveIdempotency(ctx context.Context, owner BackgroundResponseOwner, keyHash, taskID string, ttl time.Duration) (existingTaskID string, reserved bool, err error)
+	ReleaseIdempotency(ctx context.Context, owner BackgroundResponseOwner, keyHash, taskID string) error
 }
 
 type BackgroundResponseTaskService struct {
@@ -90,23 +105,69 @@ func (s *BackgroundResponseTaskService) ExecutionTimeout() time.Duration {
 }
 
 func (s *BackgroundResponseTaskService) Create(ctx context.Context, owner BackgroundResponseOwner, model string) (*BackgroundResponseTaskRecord, error) {
+	task, _, err := s.CreateWithMetadata(ctx, owner, model, BackgroundResponseTaskMetadata{})
+	return task, err
+}
+
+func (s *BackgroundResponseTaskService) CreateWithMetadata(ctx context.Context, owner BackgroundResponseOwner, model string, meta BackgroundResponseTaskMetadata) (*BackgroundResponseTaskRecord, bool, error) {
 	if !s.Enabled() {
-		return nil, ErrBackgroundResponseUnavailable
+		return nil, false, ErrBackgroundResponseUnavailable
 	}
 	now := time.Now().UTC()
 	task := &BackgroundResponseTaskRecord{
-		ID:        "resp_bg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
-		UserID:    owner.UserID,
-		APIKeyID:  owner.APIKeyID,
-		Model:     strings.TrimSpace(model),
-		Status:    BackgroundResponseStatusQueued,
-		CreatedAt: now.Unix(),
-		ExpiresAt: now.Add(s.ttl).Unix(),
+		ID:                 "resp_bg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		UserID:             owner.UserID,
+		APIKeyID:           owner.APIKeyID,
+		Model:              strings.TrimSpace(model),
+		Status:             BackgroundResponseStatusQueued,
+		CreatedAt:          now.Unix(),
+		ExpiresAt:          now.Add(s.ttl).Unix(),
+		RequestFingerprint: strings.TrimSpace(meta.RequestFingerprint),
+		IdempotencyKeyHash: strings.TrimSpace(meta.IdempotencyKeyHash),
+	}
+	if task.IdempotencyKeyHash != "" {
+		existingID, reserved, err := s.store.ReserveIdempotency(ctx, owner, task.IdempotencyKeyHash, task.ID, s.ttl)
+		if err != nil {
+			return nil, false, ErrBackgroundResponseUnavailable.WithCause(err)
+		}
+		if !reserved {
+			existing, getErr := s.store.Get(ctx, strings.TrimSpace(existingID))
+			if getErr != nil {
+				if errors.Is(getErr, ErrBackgroundResponseNotFound) {
+					// Stale reservation from a failed create; reclaim it with the new task id.
+					_ = s.store.ReleaseIdempotency(ctx, owner, task.IdempotencyKeyHash, existingID)
+					existingID, reserved, err = s.store.ReserveIdempotency(ctx, owner, task.IdempotencyKeyHash, task.ID, s.ttl)
+					if err != nil {
+						return nil, false, ErrBackgroundResponseUnavailable.WithCause(err)
+					}
+					if !reserved {
+						existing, getErr = s.store.Get(ctx, strings.TrimSpace(existingID))
+					}
+				} else {
+					return nil, false, ErrBackgroundResponseUnavailable.WithCause(getErr)
+				}
+			}
+			if !reserved {
+				if getErr != nil {
+					return nil, false, ErrBackgroundResponseUnavailable.WithCause(getErr)
+				}
+				if existing.UserID != owner.UserID || existing.APIKeyID != owner.APIKeyID {
+					return nil, false, ErrBackgroundResponseNotFound
+				}
+				if task.RequestFingerprint != "" && existing.RequestFingerprint != "" && task.RequestFingerprint != existing.RequestFingerprint {
+					return nil, false, ErrIdempotencyKeyConflict
+				}
+				return existing, false, nil
+			}
+		}
 	}
 	if err := s.store.Save(ctx, task, s.ttl); err != nil {
-		return nil, ErrBackgroundResponseUnavailable.WithCause(err)
+		if task.IdempotencyKeyHash != "" {
+			_ = s.store.ReleaseIdempotency(ctx, owner, task.IdempotencyKeyHash, task.ID)
+		}
+		return nil, false, ErrBackgroundResponseUnavailable.WithCause(err)
 	}
-	return task, nil
+	return task, true, nil
 }
 
 func (s *BackgroundResponseTaskService) Get(ctx context.Context, owner BackgroundResponseOwner, id string) (*BackgroundResponseTaskRecord, error) {
@@ -127,12 +188,61 @@ func (s *BackgroundResponseTaskService) Get(ctx context.Context, owner Backgroun
 	return task, nil
 }
 
+func (s *BackgroundResponseTaskService) GetByID(ctx context.Context, id string) (*BackgroundResponseTaskRecord, error) {
+	if !s.Enabled() {
+		return nil, ErrBackgroundResponseUnavailable
+	}
+	task, err := s.store.Get(ctx, strings.TrimSpace(id))
+	if err != nil {
+		if errors.Is(err, ErrBackgroundResponseNotFound) {
+			return nil, ErrBackgroundResponseNotFound
+		}
+		return nil, ErrBackgroundResponseUnavailable.WithCause(err)
+	}
+	return task, nil
+}
+
+func (s *BackgroundResponseTaskService) ListActive(ctx context.Context, limit int) ([]*BackgroundResponseTaskRecord, error) {
+	if !s.Enabled() {
+		return nil, ErrBackgroundResponseUnavailable
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+	tasks, err := s.store.ListActive(ctx, limit)
+	if err != nil {
+		return nil, ErrBackgroundResponseUnavailable.WithCause(err)
+	}
+	return tasks, nil
+}
+
 func (s *BackgroundResponseTaskService) MarkInProgress(ctx context.Context, id string) error {
 	return s.update(ctx, id, func(task *BackgroundResponseTaskRecord) {
 		if backgroundResponseTaskTerminal(task.Status) {
 			return
 		}
+		now := time.Now().UTC().Unix()
+		if task.StartedAt == nil {
+			task.StartedAt = &now
+		}
 		task.Status = BackgroundResponseStatusInProgress
+	})
+}
+
+func (s *BackgroundResponseTaskService) AttachUpstream(ctx context.Context, id string, accountID int64, upstreamResponseID, upstreamRequestID string) error {
+	return s.update(ctx, id, func(task *BackgroundResponseTaskRecord) {
+		if backgroundResponseTaskTerminal(task.Status) {
+			return
+		}
+		if accountID > 0 {
+			task.UpstreamAccountID = accountID
+		}
+		if upstreamResponseID = strings.TrimSpace(upstreamResponseID); upstreamResponseID != "" {
+			task.UpstreamResponseID = upstreamResponseID
+		}
+		if upstreamRequestID = strings.TrimSpace(upstreamRequestID); upstreamRequestID != "" {
+			task.UpstreamRequestID = upstreamRequestID
+		}
 	})
 }
 
@@ -184,10 +294,10 @@ func (s *BackgroundResponseTaskService) FailActiveOnStartup(ctx context.Context,
 	}
 	failed := 0
 	for _, task := range tasks {
-		if task == nil || backgroundResponseTaskTerminal(task.Status) {
+		if task == nil || backgroundResponseTaskTerminal(task.Status) || strings.TrimSpace(task.UpstreamResponseID) != "" {
 			continue
 		}
-		if err := s.Fail(ctx, task.ID, http.StatusServiceUnavailable, backgroundResponseErrorJSON("background_task_failed", "background task did not survive proxy restart")); err != nil {
+		if err := s.Fail(ctx, task.ID, http.StatusServiceUnavailable, backgroundResponseErrorJSON("background_task_failed", "background task did not survive proxy restart before upstream response id was stored")); err != nil {
 			return failed, err
 		}
 		failed++
@@ -207,7 +317,11 @@ func (s *BackgroundResponseTaskService) update(ctx context.Context, id string, m
 		return ErrBackgroundResponseUnavailable.WithCause(err)
 	}
 	mutate(task)
-	if err := s.store.Save(ctx, task, time.Until(time.Unix(task.ExpiresAt, 0))); err != nil {
+	ttl := time.Until(time.Unix(task.ExpiresAt, 0))
+	if ttl <= 0 {
+		ttl = s.ttl
+	}
+	if err := s.store.Save(ctx, task, ttl); err != nil {
 		return ErrBackgroundResponseUnavailable.WithCause(err)
 	}
 	return nil
@@ -225,6 +339,12 @@ func (s *BackgroundResponseTaskService) finish(ctx context.Context, id, status s
 		task.Result = result
 		task.Error = taskErr
 		task.CompletedAt = &completedAt
+		if status == BackgroundResponseStatusFailed {
+			task.FailedAt = &completedAt
+		}
+		if task.CreatedAt > 0 && completedAt >= task.CreatedAt {
+			task.ElapsedSeconds = completedAt - task.CreatedAt
+		}
 		task.ExpiresAt = now.Add(s.ttl).Unix()
 	})
 }
@@ -239,6 +359,6 @@ func backgroundResponseTaskTerminal(status string) bool {
 }
 
 func backgroundResponseErrorJSON(errorType, message string) json.RawMessage {
-	data, _ := json.Marshal(map[string]string{"type": errorType, "message": message})
+	data, _ := json.Marshal(map[string]string{"type": errorType, "code": errorType, "message": message})
 	return data
 }

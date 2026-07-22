@@ -325,6 +325,11 @@ func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte, opts bac
 		backgroundResponseJSONError(c, http.StatusBadRequest, "invalid_request_error", "Failed to normalize background request")
 		return
 	}
+	streamingFallbackBody, err := normalizeBackgroundResponseStreamingFallbackBody(body, true)
+	if err != nil {
+		backgroundResponseJSONError(c, http.StatusBadRequest, "invalid_request_error", "Failed to normalize background request")
+		return
+	}
 	owner := service.BackgroundResponseOwner{UserID: apiKey.UserID, APIKeyID: apiKey.ID}
 	meta, upstreamIdempotencyKey, err := backgroundResponseTaskMetadata(c, owner, body)
 	if err != nil {
@@ -352,7 +357,7 @@ func (h *BackgroundResponseHandler) submit(c *gin.Context, body []byte, opts bac
 	backgroundResponseWriteStoredTask(c, task)
 
 	if created && !backgroundResponseTaskTerminalForHandler(task.Status) {
-		go h.run(task.ID, taskCtx, recorder, cancel, owner, opts)
+		go h.run(task.ID, taskCtx, recorder, cancel, owner, opts, streamingFallbackBody)
 		return
 	}
 	cancel()
@@ -485,7 +490,7 @@ func (h *BackgroundResponseHandler) executeWithGateway(c *gin.Context) {
 	h.openAI.Responses(c)
 }
 
-func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, recorder *httptest.ResponseRecorder, cancel context.CancelFunc, owner service.BackgroundResponseOwner, opts backgroundResponseSubmitOptions) {
+func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, recorder *httptest.ResponseRecorder, cancel context.CancelFunc, owner service.BackgroundResponseOwner, opts backgroundResponseSubmitOptions, streamingFallbackBody []byte) {
 	h.running.Store(taskID, cancel)
 	defer h.running.Delete(taskID)
 	defer cancel()
@@ -549,6 +554,11 @@ func (h *BackgroundResponseHandler) run(taskID string, taskCtx *gin.Context, rec
 
 	if h.handleNativeBackgroundCreateResult(taskID, owner, createStatus, createBody, accountID, upstreamRequestID) {
 		return
+	}
+	if backgroundResponseNativeBackgroundUnsupported(createStatus, createBody) {
+		if h.executeStreamingBackgroundFallback(taskID, owner, taskCtx, streamingFallbackBody, true) {
+			return
+		}
 	}
 	if createStatus >= http.StatusOK && createStatus < http.StatusMultipleChoices {
 		if finalResponse, ok := backgroundResponseFinalResponseFromSSE(createBody, taskID); ok {
@@ -677,6 +687,44 @@ func (h *BackgroundResponseHandler) handleNativeBackgroundCreateResult(taskID st
 		}
 		return false
 	}
+}
+
+func (h *BackgroundResponseHandler) executeStreamingBackgroundFallback(taskID string, owner service.BackgroundResponseOwner, baseCtx *gin.Context, body []byte, allowStoreFalseRetry bool) bool {
+	if len(body) == 0 || !json.Valid(body) {
+		return false
+	}
+	fallbackCtx, fallbackRecorder := cloneBackgroundResponseExecutionContextWithBody(baseCtx, body)
+	statusCode, responseBody, upstreamRequestID, _, accountID := h.executeNativeBackgroundCreate(fallbackCtx, fallbackRecorder)
+	if accountID > 0 || upstreamRequestID != "" {
+		_ = h.tasks.AttachUpstream(context.Background(), taskID, accountID, "", upstreamRequestID)
+	}
+	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
+		if finalResponse, ok := backgroundResponseFinalResponseFromSSE(responseBody, taskID); ok {
+			if err := h.tasks.Complete(context.Background(), taskID, statusCode, finalResponse); err != nil {
+				logger.L().Error("background_response.complete_store_failed", zap.String("response_id", taskID), zap.Error(err))
+			}
+			return true
+		}
+		if taskErr, ok := backgroundResponseErrorFromSSE(responseBody); ok {
+			h.failTask(taskID, http.StatusBadGateway, taskErr)
+			return true
+		}
+	}
+	if upstreamID := backgroundResponseUpstreamIDFromSSE(responseBody); upstreamID != "" {
+		if err := h.tasks.AttachUpstream(context.Background(), taskID, accountID, upstreamID, upstreamRequestID); err != nil {
+			logger.L().Error("background_response.attach_upstream_from_stream_fallback_failed", zap.String("response_id", taskID), zap.String("upstream_response_id", upstreamID), zap.Error(err))
+		}
+		h.pollNativeBackground(taskID, owner)
+		return true
+	}
+	if allowStoreFalseRetry && backgroundResponseStreamingStoreUnsupported(statusCode, responseBody) {
+		if original, err := normalizeBackgroundResponseStreamingFallbackBody(body, false); err == nil {
+			logger.L().Warn("background_response.streaming_fallback_store_true_unsupported", zap.String("response_id", taskID))
+			return h.executeStreamingBackgroundFallback(taskID, owner, baseCtx, original, false)
+		}
+	}
+	h.failTask(taskID, statusCode, classifyBackgroundResponseFailure(statusCode, responseBody, extractBackgroundResponseError(responseBody)))
+	return true
 }
 
 func (h *BackgroundResponseHandler) pollNativeBackground(taskID string, owner service.BackgroundResponseOwner) {
@@ -843,6 +891,12 @@ func cloneBackgroundResponseExecutionContext(c *gin.Context) (*gin.Context, *htt
 	return clone, recorder
 }
 
+func cloneBackgroundResponseExecutionContextWithBody(c *gin.Context, body []byte) (*gin.Context, *httptest.ResponseRecorder) {
+	clone, recorder := cloneBackgroundResponseExecutionContext(c)
+	restoreBackgroundResponseRequestBody(clone.Request, body)
+	return clone, recorder
+}
+
 func normalizeBackgroundResponseNativeCreateBody(body []byte) ([]byte, error) {
 	var err error
 	body, err = sjson.SetBytes(body, "background", true)
@@ -858,6 +912,39 @@ func normalizeBackgroundResponseNativeCreateBody(body []byte) ([]byte, error) {
 		return nil, err
 	}
 	return body, nil
+}
+
+func normalizeBackgroundResponseStreamingFallbackBody(body []byte, store bool) ([]byte, error) {
+	var err error
+	body, err = sjson.DeleteBytes(body, "background")
+	if err != nil {
+		return nil, err
+	}
+	body, err = sjson.SetBytes(body, "stream", true)
+	if err != nil {
+		return nil, err
+	}
+	body, err = sjson.SetBytes(body, "store", store)
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func backgroundResponseNativeBackgroundUnsupported(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "unsupported parameter") && strings.Contains(text, "background")
+}
+
+func backgroundResponseStreamingStoreUnsupported(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "unsupported parameter") && strings.Contains(text, "store")
 }
 
 func backgroundResponseIsHeavyWebSearch(body []byte) bool {

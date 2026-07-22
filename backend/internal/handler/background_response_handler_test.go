@@ -666,6 +666,63 @@ func TestBackgroundResponseSSECreatedEOFRecoversByPolling(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestBackgroundResponseUnsupportedNativeBackgroundFallsBackToStreamingStoreTrue(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	var bodies [][]byte
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
+	h.execute = func(c *gin.Context) {
+		body, err := io.ReadAll(c.Request.Body)
+		require.NoError(t, err)
+		bodies = append(bodies, append([]byte(nil), body...))
+		if len(bodies) == 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "Unsupported parameter: background"})
+			return
+		}
+		require.False(t, gjson.GetBytes(body, "background").Exists())
+		require.True(t, gjson.GetBytes(body, "stream").Bool())
+		require.True(t, gjson.GetBytes(body, "store").Bool())
+		c.Header("Content-Type", "text/event-stream")
+		_, _ = c.Writer.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_up_stream","object":"response","status":"completed","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}` + "\n\n"))
+	}
+
+	id := submitHeavyBackgroundForTest(t, backgroundResponseTestRouter(h))
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
+		return err == nil && got.Status == service.BackgroundResponseStatusCompleted
+	}, time.Second, 10*time.Millisecond)
+	require.Len(t, bodies, 2)
+	require.True(t, gjson.GetBytes(bodies[0], "background").Bool())
+}
+
+func TestBackgroundResponseUnsupportedNativeStreamingCreatedEOFStillPolls(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}
+	tasks := service.NewBackgroundResponseTaskServiceWithOptions(store, time.Hour, time.Hour)
+	calls := 0
+	h := &BackgroundResponseHandler{tasks: tasks, heavyQueue: newBackgroundResponseHeavyQueue(), pollInterval: time.Millisecond}
+	h.execute = func(c *gin.Context) {
+		calls++
+		if calls == 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "Unsupported parameter: background"})
+			return
+		}
+		c.Status(http.StatusBadGateway)
+		_, _ = c.Writer.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_up_stream_recover","status":"in_progress"}}` + "\n\nunexpected EOF"))
+	}
+	h.fetchUpstream = func(_ context.Context, task *service.BackgroundResponseTaskRecord) (*backgroundUpstreamPollResult, error) {
+		require.Equal(t, "resp_up_stream_recover", task.UpstreamResponseID)
+		return &backgroundUpstreamPollResult{statusCode: http.StatusOK, body: []byte(`{"id":"resp_up_stream_recover","object":"response","status":"completed","model":"gpt-5.6-sol","output":[]}`)}, nil
+	}
+
+	id := submitHeavyBackgroundForTest(t, backgroundResponseTestRouter(h))
+	require.Eventually(t, func() bool {
+		got, err := tasks.Get(context.Background(), service.BackgroundResponseOwner{UserID: 7, APIKeyID: 9}, id)
+		return err == nil && got.Status == service.BackgroundResponseStatusCompleted && got.UpstreamResponseID == "resp_up_stream_recover"
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestBackgroundResponseEOFBeforeIDRetriesWithSameIdempotencyKey(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := &backgroundResponseHandlerMemoryStore{tasks: make(map[string]*service.BackgroundResponseTaskRecord)}

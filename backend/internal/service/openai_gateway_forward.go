@@ -1106,7 +1106,35 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	// 账号级请求头覆写（仅 openai api_key 账号启用时生效；OAuth 路径 no-op）
 	account.ApplyHeaderOverrides(req.Header)
 
+	if err := s.captureOpenAIBackgroundUpstreamBindingOnRequest(ctx, c, account, body); err != nil {
+		return nil, err
+	}
+
 	return req, nil
+}
+
+// captureOpenAIBackgroundUpstreamBindingOnRequest snapshots the exact selected
+// account after authentication/header construction has completed. Capturing
+// here (rather than reloading by account id after the POST) also observes any
+// Agent Identity task registration performed while building authentication.
+func (s *OpenAIGatewayService) captureOpenAIBackgroundUpstreamBindingOnRequest(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+) error {
+	if !gjson.GetBytes(body, "background").Bool() {
+		return nil
+	}
+	if c == nil || c.Request == nil {
+		return fmt.Errorf("%w: request context unavailable", ErrOpenAIBackgroundUpstreamBindingInvalid)
+	}
+	binding, err := s.CaptureOpenAIBackgroundUpstreamBindingForAccount(ctx, account)
+	if err != nil {
+		return fmt.Errorf("capture native background upstream binding: %w", err)
+	}
+	c.Request = c.Request.WithContext(WithOpenAIBackgroundUpstreamBinding(c.Request.Context(), binding))
+	return nil
 }
 
 // overrideBrowserUserAgent 检查请求的最终 user-agent，若为浏览器 UA 则替换为后台配置的 Codex UA。

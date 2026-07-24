@@ -1103,7 +1103,21 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 		if bodyLooksLikeSSE {
 			return s.handleSSEToJSON(resp, c, body, originalModel, mappedModel)
 		}
-		return nil, fmt.Errorf("parse response: invalid json response")
+		// A native Responses background create is acknowledged before the
+		// upstream task has consumed any tokens. OpenAI therefore legitimately
+		// returns a queued/in_progress Response with a stable id and no usage
+		// object (or usage:null). Requiring usage here turns that successful
+		// acknowledgement into a local parse failure, so the handler never gets
+		// the upstream id it needs to persist and poll.
+		//
+		// Keep the exception deliberately narrow: the request builder must have
+		// captured an immutable native-background upstream binding on this exact
+		// request, and the body must be an official Response acknowledgement.
+		// Ordinary non-background JSON without usage remains invalid.
+		if !isOpenAIBackgroundCreateAcknowledgement(c, body) {
+			return nil, fmt.Errorf("parse response: invalid json response")
+		}
+		usageValue = OpenAIUsage{}
 	}
 	usage := &usageValue
 
@@ -1135,6 +1149,27 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 		imageCount:       countOpenAIResponseImageOutputsFromJSONBytes(body),
 		imageOutputSizes: collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
 	}, nil
+}
+
+func isOpenAIBackgroundCreateAcknowledgement(c *gin.Context, body []byte) bool {
+	if c == nil || c.Request == nil || len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	if _, ok := OpenAIBackgroundUpstreamBindingFromContext(c.Request.Context()); !ok {
+		return false
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "object").String()) != "response" {
+		return false
+	}
+	if strings.TrimSpace(extractOpenAIResponseIDFromJSONBytes(body)) == "" {
+		return false
+	}
+	switch strings.TrimSpace(gjson.GetBytes(body, "status").String()) {
+	case BackgroundResponseStatusQueued, BackgroundResponseStatusInProgress:
+		return true
+	default:
+		return false
+	}
 }
 
 func isEventStreamResponse(header http.Header) bool {

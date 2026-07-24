@@ -194,6 +194,9 @@ func postUsageBilling(ctx context.Context, p *postUsageBillingParams, deps *bill
 
 func resolveUsageBillingRequestID(ctx context.Context, upstreamRequestID string) string {
 	if ctx != nil {
+		if override, _ := ctx.Value(usageBillingRequestIDOverrideContextKey{}).(string); strings.TrimSpace(override) != "" {
+			return strings.TrimSpace(override)
+		}
 		if clientRequestID, _ := ctx.Value(ctxkey.ClientRequestID).(string); strings.TrimSpace(clientRequestID) != "" {
 			return "client:" + strings.TrimSpace(clientRequestID)
 		}

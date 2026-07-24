@@ -582,6 +582,19 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
+					// A native background create cannot be safely replayed even on
+					// the same account after an ambiguous transport failure: the
+					// first POST may already have created a billable task while no
+					// response id reached the proxy. Persist the classified failure
+					// and let an explicit idempotent client replay decide recovery.
+					if c.GetBool(responsesDisableCrossAccountFailoverKey) {
+						reqLog.Warn("openai.background_create_failover_blocked",
+							zap.Int64("account_id", account.ID),
+							zap.Int("upstream_status", failoverErr.StatusCode),
+						)
+						h.handleFailoverExhausted(c, failoverErr, streamStarted)
+						return
+					}
 					// 池模式：同账号重试
 					if failoverErr.RetryableOnSameAccount {
 						retryLimit := account.GetPoolModeRetryCount()
@@ -660,6 +673,23 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, account.GetMappedModel(reqModel), openAIForwardSucceededForScheduling(result), result.FirstTokenMs)
 		} else {
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, account.GetMappedModel(reqModel), openAIForwardSucceededForScheduling(result), nil)
+		}
+
+		// Native background creation only acknowledges queued/in_progress and
+		// legitimately has no usage yet. Billing this internal create request
+		// would write a zero-token dedup row and prevent the terminal polling
+		// result from being settled. BackgroundResponseHandler records the
+		// completed response with a stable proxy-task request id instead.
+		if c.GetBool(responsesInternalBackgroundExecuteKey) {
+			upstreamResponseID := ""
+			if result != nil {
+				upstreamResponseID = result.ResponseID
+			}
+			reqLog.Debug("openai.background_create_usage_deferred",
+				zap.Int64("account_id", account.ID),
+				zap.String("upstream_response_id", upstreamResponseID),
+			)
+			return
 		}
 
 		// 捕获请求信息（用于异步记录，避免在 goroutine 中访问 gin.Context）

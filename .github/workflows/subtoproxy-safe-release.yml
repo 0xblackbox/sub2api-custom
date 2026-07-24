@@ -148,4 +148,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$CUSTOM_TAG (SubtoProxy safe channel)" \
-            --notes "Based on official ${OFFICIAL_TAG}. Includes the SubtoProxy native Responses background polling layer, OAuth SSE-created persistence/recovery, heavy Web Search queue isolation, custom-only updater, checksum verification, tests, and one-click automatic restart."
+            --notes "Based on official ${OFFICIAL_TAG}. Includes native Responses background polling with persistent identity binding, atomic task state and worker leases, explicit unsupported-provider rejection, heavy Web Search queue isolation, custom-only updater, checksum verification, tests, and one-click automatic restart."

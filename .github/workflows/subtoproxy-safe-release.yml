@@ -3,9 +3,10 @@ name: SubtoProxy safe release
 on:
   workflow_dispatch:
   schedule:
-    # Check four times a day. If the compatibility patch no longer applies or
-    # tests fail, the workflow stops before publishing anything.
-    - cron: '17 */6 * * *'
+    # One daily check is enough for upstream releases. Expected source drift is
+    # reported as a warning and skips publishing instead of generating a failed
+    # run (and another email) every few hours.
+    - cron: '17 2 * * *'
 
 permissions:
   contents: write
@@ -75,22 +76,48 @@ jobs:
           git -C .safe-build/upstream fetch --depth=1 origin "refs/tags/${{ steps.version.outputs.official_tag }}:refs/tags/${{ steps.version.outputs.official_tag }}"
           git -C .safe-build/upstream checkout --detach "${{ steps.version.outputs.official_tag }}"
 
-      - name: Apply compatibility layer (fail closed)
+      - name: Check and apply compatibility layer (fail closed)
+        id: compatibility
         if: steps.version.outputs.skip != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          OFFICIAL_TAG: ${{ steps.version.outputs.official_tag }}
         run: |
           set -euo pipefail
-          git -C .safe-build/upstream apply --check ../../custom/patches/subtoproxy.patch
+
+          if ! git -C .safe-build/upstream apply --check ../../custom/patches/subtoproxy.patch; then
+            echo "compatible=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Compatibility update required::The custom patch does not apply to ${OFFICIAL_TAG}; no release was built or published."
+            {
+              echo "### Safe release skipped"
+              echo
+              echo "The compatibility patch does not apply cleanly to \`${OFFICIAL_TAG}\`."
+              echo "Publishing was stopped before build or release. Rebase the patch, test it,"
+              echo "and then run this workflow manually."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            # A scheduled compatibility probe is an expected, fail-closed
+            # no-op. A manually requested release remains a hard failure so an
+            # operator cannot mistake the warning for a published build.
+            if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+              echo "Manual safe release requires a rebased compatibility patch for ${OFFICIAL_TAG}." >&2
+              exit 1
+            fi
+            exit 0
+          fi
+
           git -C .safe-build/upstream apply ../../custom/patches/subtoproxy.patch
           grep -q '0xblackbox/sub2api-custom' .safe-build/upstream/backend/internal/service/update_service.go
+          echo "compatible=true" >> "$GITHUB_OUTPUT"
 
       - name: Setup pnpm
-        if: steps.version.outputs.skip != 'true'
+        if: steps.version.outputs.skip != 'true' && steps.compatibility.outputs.compatible == 'true'
         uses: pnpm/action-setup@v6
         with:
           version: 9
 
       - name: Setup Node.js
-        if: steps.version.outputs.skip != 'true'
+        if: steps.version.outputs.skip != 'true' && steps.compatibility.outputs.compatible == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: '20'
@@ -98,7 +125,7 @@ jobs:
           cache-dependency-path: .safe-build/upstream/frontend/pnpm-lock.yaml
 
       - name: Build embedded frontend
-        if: steps.version.outputs.skip != 'true'
+        if: steps.version.outputs.skip != 'true' && steps.compatibility.outputs.compatible == 'true'
         working-directory: .safe-build/upstream/frontend
         run: |
           set -euo pipefail
@@ -106,21 +133,21 @@ jobs:
           pnpm run build
 
       - name: Setup Go
-        if: steps.version.outputs.skip != 'true'
+        if: steps.version.outputs.skip != 'true' && steps.compatibility.outputs.compatible == 'true'
         uses: actions/setup-go@v6
         with:
           go-version-file: .safe-build/upstream/backend/go.mod
           cache-dependency-path: .safe-build/upstream/backend/go.sum
 
       - name: Run compatibility tests
-        if: steps.version.outputs.skip != 'true'
+        if: steps.version.outputs.skip != 'true' && steps.compatibility.outputs.compatible == 'true'
         working-directory: .safe-build/upstream/backend
         run: |
           set -euo pipefail
           go test -tags=unit ./internal/service ./internal/repository ./internal/handler ./internal/server/middleware
 
       - name: Build release archive and checksum
-        if: steps.version.outputs.skip != 'true'
+        if: steps.version.outputs.skip != 'true' && steps.compatibility.outputs.compatible == 'true'
         working-directory: .safe-build/upstream/backend
         env:
           CUSTOM_VERSION: ${{ steps.version.outputs.custom_version }}
@@ -135,7 +162,7 @@ jobs:
           (cd dist && sha256sum sub2api_linux_amd64.tar.gz > checksums.txt)
 
       - name: Publish safe custom release
-        if: steps.version.outputs.skip != 'true'
+        if: steps.version.outputs.skip != 'true' && steps.compatibility.outputs.compatible == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           CUSTOM_TAG: ${{ steps.version.outputs.custom_tag }}

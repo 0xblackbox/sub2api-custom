@@ -18,7 +18,7 @@ concurrency:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout custom channel
         uses: actions/checkout@v6
@@ -62,8 +62,14 @@ jobs:
           echo "custom_tag=$custom_tag" >> "$GITHUB_OUTPUT"
 
           if gh release view "$custom_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Safe release $custom_tag already exists."
+            assets="$(gh release view "$custom_tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            if grep -Fxq 'sub2api_linux_amd64.tar.gz' <<<"$assets" && grep -Fxq 'checksums.txt' <<<"$assets"; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Safe release $custom_tag already exists with the required archive and checksum."
+            else
+              echo "Existing safe release $custom_tag is incomplete; refusing to skip or overwrite it." >&2
+              exit 1
+            fi
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -108,6 +114,9 @@ jobs:
 
           git -C .safe-build/upstream apply ../../custom/patches/subtoproxy.patch
           grep -q '0xblackbox/sub2api-custom' .safe-build/upstream/backend/internal/service/update_service.go
+          grep -q 'checksums.txt is required for custom-channel updates' .safe-build/upstream/backend/internal/service/update_service.go
+          grep -q "const GITHUB_REPO = '0xblackbox/sub2api-custom'" .safe-build/upstream/frontend/src/components/common/VersionBadge.vue
+          grep -q '^GITHUB_REPO="0xblackbox/sub2api-custom"$' deploy/install.sh
           echo "compatible=true" >> "$GITHUB_OUTPUT"
 
       - name: Setup pnpm
@@ -144,7 +153,13 @@ jobs:
         working-directory: .safe-build/upstream/backend
         run: |
           set -euo pipefail
-          go test -tags=unit ./internal/service ./internal/repository ./internal/handler ./internal/server/middleware
+          go test -count=1 -tags=unit \
+            ./internal/pkg/openai \
+            ./internal/service \
+            ./internal/repository \
+            ./internal/handler \
+            ./internal/server/middleware \
+            ./internal/server/routes
 
       - name: Build release archive and checksum
         if: steps.version.outputs.skip != 'true' && steps.compatibility.outputs.compatible == 'true'

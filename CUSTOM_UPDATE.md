@@ -9,7 +9,7 @@
 
 ## 工作方式
 
-1. GitHub Actions 每 6 小时检查一次官方最新稳定 Release。
+1. GitHub Actions 每天检查一次官方最新稳定 Release，也可在 Actions 页面手动立即运行。
 2. 在干净的官方源码上应用 `custom/patches/subtoproxy.patch`。
 3. 构建前端并运行后端兼容性测试。
 4. 只有补丁可完整应用且测试全部通过，才发布自定义 Release。
